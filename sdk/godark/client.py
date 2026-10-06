@@ -1,0 +1,1942 @@
+"""GodarkClient -- the main entry point for the GoDark Python Trading SDK."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import logging
+import os
+import time
+import uuid
+from collections.abc import AsyncIterator, Callable
+from enum import Enum
+from typing import Any, Literal, TypeVar
+
+from . import _identity, _proto
+from ._hpke import pinned_sequencer_static_pub
+from ._session import CryptoSession
+from ._symbols import (
+    InstrumentDecimals,
+    load_instruments_from_edge,
+    load_offline_decimals_map,
+    load_offline_symbol_map,
+)
+from ._transport import EdgeTransport, TransportConfig
+from ._wire import build_order_header_proto, encode_encrypted_order, encrypted_order_request
+from .enums import (
+    _RESPONSE_MESSAGE_TYPE_TO_PROTO,
+    OrderStatus,
+    OrderType,
+    OrderUpdateType,
+    PositionUpdateType,
+    Side,
+    TimeInForce,
+)
+from .errors import (
+    AuthenticationError,
+    ConnectionError,
+    EncryptionError,
+    GodarkError,
+    OrderError,
+    SessionError,
+    TimeoutError,
+)
+from .order_error_code import make_order_error_from_json
+from .data_types import (
+    AccountMarginUpdate,
+    BalanceUpdate,
+    BatchCancelAck,
+    BatchCancelLegResult,
+    BatchModifyAck,
+    BatchModifyLegResult,
+    CountAck,
+    FundingRateUpdate,
+    LeverageSettings,
+    MarginAlert,
+    MassQuoteAck,
+    MassQuoteLegResult,
+    OpenOrdersSnapshot,
+    OrderAck,
+    OrderUpdate,
+    PlaceOrderOptions,
+    PositionsSnapshot,
+    PositionUpdate,
+    SettlementUpdate,
+    SystemHealthUpdate,
+    TpslAck,
+    UnknownSequencerPush,
+)
+from .ws_admit_error_code import is_ws_admit_code, resolve_ws_admit_message
+
+TStream = TypeVar("TStream")
+
+logger = logging.getLogger("godark")
+
+_REQUEST_TYPE_MAP = {"place": "place", "cancel": "cancel", "modify": "modify"}
+
+# Encrypted command request_type -> the ack message_type it resolves on. Batched
+# commands get their own ack type so an async order "ack" pushed mid-flight does
+# not resolve them early; everything else falls back to the generic "ack".
+_INFLIGHT_ACK_TYPE = {
+    "mass_quote": "mass_quote_ack",
+    "batch_cancel": "batch_cancel_ack",
+    "batch_modify": "batch_modify_ack",
+    "amend_tpsl": "tpsl_ack",
+    "cancel_tpsl": "tpsl_ack",
+    "cancel_all": "cancel_all_ack",
+    "close_all": "close_all_ack",
+    "reverse": "reverse_ack",
+}
+
+# Testnet WebSocket origin (GodarkClient appends `/ws/v1`).
+_DEFAULT_EDGE_BASE_URL = "wss://api.godark-dex.com"
+
+# Devnet WebSocket origin (GodarkClient appends `/ws/v1`).
+_DEVNET_EDGE_BASE_URL = "wss://api.devnet.godark-dex.com"
+
+# Sequencer HPKE static public keys (64 hex). These are public pins, not
+# user secrets — Testnet and Devnet use distinct sequencer keys.
+_TESTNET_HPKE_STATIC_PUBLIC_KEY_HEX = (
+    "a9fdd7f26c0de36d82811e9fe1df2509960cd5b25eef037355e209b9222bea7d"
+)
+_DEVNET_HPKE_STATIC_PUBLIC_KEY_HEX = (
+    "a6807e2f6cd04b54cc19be2fd4faea2a1239f1e2896912d91222678ab54cdd45"
+)
+
+
+class Environment(Enum):
+    """Named deployment target.
+
+    Selects the default edge URL and, when known, a baked-in sequencer HPKE
+    public key pin. Explicit ``base_url`` / ``hpke_static_public_key_hex`` and
+    the corresponding environment variables still win over these presets.
+    """
+
+    TESTNET = "testnet"
+    DEVNET = "devnet"
+    LOCALNET = "localnet"
+
+    @property
+    def edge_base_url(self) -> str:
+        """Default edge base URL for this environment (host only)."""
+        if self is Environment.DEVNET:
+            return _DEVNET_EDGE_BASE_URL
+        if self is Environment.LOCALNET:
+            return "ws://127.0.0.1:4000"
+        return _DEFAULT_EDGE_BASE_URL
+
+    @property
+    def hpke_static_public_key_hex(self) -> str | None:
+        """Baked-in sequencer HPKE static public key (64 hex), when known."""
+        if self is Environment.TESTNET:
+            return _TESTNET_HPKE_STATIC_PUBLIC_KEY_HEX
+        if self is Environment.DEVNET:
+            return _DEVNET_HPKE_STATIC_PUBLIC_KEY_HEX
+        return None
+
+
+def _resolve_edge_base_url(explicit: str | None, default: str = _DEFAULT_EDGE_BASE_URL) -> str:
+    """
+    Resolve edge base URL: constructor arg wins, then env, then ``default``.
+
+    Reads ``GODARK_EDGE_URL`` or ``GDX_EDGE_URL`` (first non-empty) so localnet /
+    scripts can set the host without passing ``base_url`` in code.
+    """
+    if explicit is not None and str(explicit).strip() != "":
+        return str(explicit).strip()
+    for key in ("GODARK_EDGE_URL", "GDX_EDGE_URL"):
+        v = os.environ.get(key, "").strip()
+        if v:
+            return v
+    return default
+
+
+def _infer_environment_from_edge_url(edge_base: str) -> Environment:
+    """Infer Environment from edge/REST host for HPKE pin baking."""
+    host = (edge_base or "").strip().lower()
+    for prefix in ("https://", "http://", "wss://", "ws://"):
+        if host.startswith(prefix):
+            host = host[len(prefix) :]
+            break
+    host = host.split("/", 1)[0]
+    host = host.split(":", 1)[0]
+    if host in ("127.0.0.1", "localhost") or host.endswith(".localhost"):
+        return Environment.LOCALNET
+    if "devnet" in host:
+        return Environment.DEVNET
+    if "godark-dex.com" in host:
+        return Environment.TESTNET
+    return Environment.TESTNET
+
+
+def _resolve_hpke_static_public_key_hex(
+    explicit: str | None, environment: Environment
+) -> str | None:
+    """Resolve HPKE pin: explicit arg → env vars → environment preset."""
+    if explicit is not None and str(explicit).strip() != "":
+        return str(explicit).strip()
+    for key in (
+        "GDX_HPKE_STATIC_PUBLIC_KEY",
+        "GDX_HPKE_STATIC_PUBKEY",
+        "GODARK_HPKE_STATIC_PUBLIC_KEY",
+        "VITE_GDX_HPKE_STATIC_PUBKEY",
+    ):
+        v = os.environ.get(key, "").strip()
+        if v:
+            return v
+    return environment.hpke_static_public_key_hex
+
+
+def _resolve_account(explicit: str | None) -> str | None:
+    """Resolve account: constructor arg wins, then env vars."""
+    if explicit is not None and str(explicit).strip() != "":
+        return str(explicit).strip()
+    for key in ("GODARK_ACCOUNT", "GDX_ACCOUNT"):
+        v = os.environ.get(key, "").strip()
+        if v:
+            return v
+    return None
+
+
+def _resolve_passphrase(explicit: str | None) -> str | None:
+    """Resolve passphrase: constructor arg wins, then env vars."""
+    if explicit is not None and str(explicit).strip() != "":
+        return str(explicit).strip()
+    for key in ("GODARK_PASSPHRASE", "GDX_PASSPHRASE"):
+        v = os.environ.get(key, "").strip()
+        if v:
+            return v
+    return None
+
+
+def _rewrite_http_to_ws(url: str) -> str:
+    if url.startswith("http://"):
+        return "ws://" + url[len("http://") :]
+    if url.startswith("https://"):
+        return "wss://" + url[len("https://") :]
+    return url
+
+
+def _ws_url(base_url: str) -> str:
+    """Return the canonical WebSocket URL ending in ``/ws/v1``.
+
+    - Rewrites ``http(s)://`` to ``ws(s)://``.
+    - If ``base_url`` already ends with ``/ws/v1``, returns it unchanged.
+    - If it ends with the legacy ``/ws`` suffix, upgrades it to ``/ws/v1``.
+    - Otherwise, appends ``/ws/v1`` to the (slash-stripped) base.
+    """
+    url = _rewrite_http_to_ws(base_url.rstrip("/"))
+    if url.endswith("/ws/v1"):
+        return url
+    if url.endswith("/ws"):
+        return url + "/v1"
+    return url + "/ws/v1"
+
+
+def _new_correlation_id() -> bytes:
+    return uuid.uuid4().bytes
+
+
+def _timestamp_ns() -> int:
+    return int(time.time() * 1_000_000_000)
+
+
+class GodarkClient:
+    """
+    Async trading client for the GoDark DEX.
+
+    Handles API-key authentication, HPKE session negotiation, bound-AEAD
+    encrypted order flow, and real-time order/position streaming.
+
+    Parameters:
+        api_key: Legacy single opaque API key.
+        api_key_id: Key-pair public ID (use with ``api_secret`` and ``passphrase``).
+        api_secret: Key-pair secret (use with ``api_key_id`` and ``passphrase``).
+        passphrase: User-chosen API key passphrase (required with key pair; also reads
+            ``GODARK_PASSPHRASE`` / ``GDX_PASSPHRASE``).
+        environment: Named deployment preset (``Environment.TESTNET`` default).
+            Supplies the default edge URL and, for Testnet/Devnet, each
+            environment's published sequencer HPKE pin when those are not
+            set explicitly or via env.
+        base_url: Edge WebSocket origin (host only, e.g.
+            ``wss://api.godark-dex.com``). The client appends ``/ws/v1`` to
+            produce the final upgrade URL. Preference: arg →
+            ``GODARK_EDGE_URL`` / ``GDX_EDGE_URL`` → ``environment`` preset.
+        account: Fallback base58 32-byte account when the edge auth response omits it
+            (e.g. local edge). Also reads ``GODARK_ACCOUNT`` / ``GDX_ACCOUNT``.
+        auto_reconnect: Automatically reconnect on disconnect.
+        symbol_map: Custom symbol-name-to-id mapping.
+        transport: Low-level transport config (TLS, timeouts, etc.).
+        stream_buffer_size: Max buffered order/position updates.
+        place_order_terminal_timeout: Seconds to wait after the fast place ack for
+            an OPEN/reject/fill/cancel update when ``confirmation="book"``.
+            Defaults to the command timeout.
+        hpke_static_public_key_hex: Pinned 32-byte sequencer X25519 static key
+            in hexadecimal. Preference: arg → ``GDX_HPKE_STATIC_PUBLIC_KEY``
+            (aliases ``GDX_HPKE_STATIC_PUBKEY`` / ``GODARK_HPKE_STATIC_PUBLIC_KEY``)
+            → baked-in pin from ``environment`` (Testnet/Devnet only).
+
+    Usage::
+
+        async with GodarkClient(
+            api_key_id="gdk_…", api_secret="…", passphrase="your-passphrase"
+        ) as client:
+            ...
+
+        # Local edge (no account in auth response):
+        async with GodarkClient(
+            api_key="test-key-1",
+            environment=Environment.LOCALNET,
+            account="11111111111111111111111111111111",
+            hpke_static_public_key_hex="…",  # required on localnet
+        ) as client:
+            ack = await client.place_order(
+                symbol="BTC-USDC-PERP", side="BUY", order_type="LIMIT",
+                price="67500.0", quantity="0.1",
+            )
+            print(ack.order_id)
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        api_key_id: str | None = None,
+        api_secret: str | None = None,
+        passphrase: str | None = None,
+        environment: Environment = Environment.TESTNET,
+        base_url: str | None = None,
+        account: str | None = None,
+        auto_reconnect: bool = True,
+        symbol_map: dict[str, int] | None = None,
+        transport: TransportConfig | None = None,
+        stream_buffer_size: int = 256,
+        place_order_terminal_timeout: float | None = None,
+        hpke_static_public_key_hex: str | None = None,
+        user_uuid: str | None = None,
+    ):
+        if api_key_id is not None or api_secret is not None:
+            if api_key_id is None or api_secret is None:
+                raise ValueError("api_key_id and api_secret must be provided together")
+            if api_key is not None:
+                raise ValueError("use either api_key or (api_key_id, api_secret), not both")
+            resolved_passphrase = _resolve_passphrase(passphrase)
+            if resolved_passphrase is None:
+                raise ValueError("passphrase is required when using api_key_id and api_secret")
+            self._api_key_id = api_key_id
+            self._api_secret = api_secret
+            self._passphrase = resolved_passphrase
+            self._auth_token: str | None = None
+        elif api_key is not None:
+            if passphrase is not None and str(passphrase).strip() != "":
+                raise ValueError("passphrase must not be set when using legacy api_key")
+            self._api_key_id = None
+            self._api_secret = None
+            self._passphrase = None
+            self._auth_token = api_key
+        else:
+            raise ValueError("provide api_key or both api_key_id and api_secret")
+
+        if not isinstance(environment, Environment):
+            raise TypeError("environment must be an Environment")
+
+        self._environment = environment
+        self._base_url = _resolve_edge_base_url(base_url, environment.edge_base_url)
+        if account is not None and user_uuid is not None:
+            raise ValueError("use account, not both account and deprecated user_uuid")
+        self._config_account = _resolve_account(account if account is not None else user_uuid)
+        self._auto_reconnect = auto_reconnect
+        self._user_symbol_map = symbol_map is not None
+        self._symbol_map = dict(symbol_map) if symbol_map is not None else load_offline_symbol_map()
+        self._decimals_map: dict[str, InstrumentDecimals] = (
+            load_offline_decimals_map() if symbol_map is None else {}
+        )
+        self._transport_config = transport
+        pin_env = (
+            _infer_environment_from_edge_url(base_url)
+            if base_url is not None and str(base_url).strip() != ""
+            else environment
+        )
+        self._hpke_static_public_key_hex = _resolve_hpke_static_public_key_hex(
+            hpke_static_public_key_hex, pin_env
+        )
+        self._place_order_terminal_timeout = (
+            place_order_terminal_timeout
+            if place_order_terminal_timeout is not None
+            else (
+                transport.command_timeout
+                if transport is not None and transport.command_timeout is not None
+                else EdgeTransport.COMMAND_TIMEOUT
+            )
+        )
+
+        if stream_buffer_size < 1:
+            raise ValueError("stream_buffer_size must be >= 1")
+
+        self._transport = EdgeTransport(_ws_url(self._base_url), self._transport_config)
+        self._session = CryptoSession()
+        self._conn_id = 0
+        self._account: str | None = None
+        self._account_id: str | None = None
+        self._login_session_id: str | None = None
+        self._token_expires_at: str | None = None
+        self._cancel_on_disconnect = False
+        self._connected = False
+        # The ack message_type the currently in-flight encrypted command waits
+        # for (set by _send_encrypted_command); guards batch acks from being
+        # resolved early by an unrelated async "ack" push.
+        self._inflight_response_type: str | None = None
+        # Per-correlation expected ack type for concurrent in-flight commands.
+        self._expected_ack_by_correlation: dict[str, str] = {}
+
+        self._desired_channels: set[str] = set()
+        self._order_queue: asyncio.Queue[OrderUpdate] = asyncio.Queue(maxsize=stream_buffer_size)
+        self._position_queue: asyncio.Queue[PositionUpdate] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._positions_snapshot_queue: asyncio.Queue[PositionsSnapshot] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._system_health_queue: asyncio.Queue[SystemHealthUpdate] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._balance_queue: asyncio.Queue[BalanceUpdate] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._margin_alert_queue: asyncio.Queue[MarginAlert] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._account_margin_queue: asyncio.Queue[AccountMarginUpdate] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._funding_rate_queue: asyncio.Queue[FundingRateUpdate] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._volume_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._open_interest_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._open_orders_snapshot_queue: asyncio.Queue[OpenOrdersSnapshot] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._settlement_queue: asyncio.Queue[SettlementUpdate] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._leverage_settings_queue: asyncio.Queue[LeverageSettings] = asyncio.Queue(
+            maxsize=stream_buffer_size
+        )
+        self._order_callbacks: list[Callable[[OrderUpdate], None]] = []
+        self._position_callbacks: list[Callable[[PositionUpdate], None]] = []
+        self._positions_snapshot_callbacks: list[Callable[[PositionsSnapshot], None]] = []
+        self._system_health_callbacks: list[Callable[[SystemHealthUpdate], None]] = []
+        self._balance_callbacks: list[Callable[[BalanceUpdate], None]] = []
+        self._margin_alert_callbacks: list[Callable[[MarginAlert], None]] = []
+        self._account_margin_callbacks: list[Callable[[AccountMarginUpdate], None]] = []
+        self._funding_rate_callbacks: list[Callable[[FundingRateUpdate], None]] = []
+        self._volume_callbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._open_interest_callbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._open_orders_snapshot_callbacks: list[Callable[[OpenOrdersSnapshot], None]] = []
+        self._settlement_callbacks: list[Callable[[SettlementUpdate], None]] = []
+        self._leverage_settings_callbacks: list[Callable[[LeverageSettings], None]] = []
+        self._reconnect_callbacks: list[Callable[[], None]] = []
+        self._error_callbacks: list[Callable[[BaseException], None]] = []
+        self._place_outcome_waiters: list[dict[str, Any]] = []
+        self._recent_terminal_updates: list[OrderUpdate] = []
+        self._pending_encrypted_by_nonce: dict[int, dict] = {}
+        # Filled only after POST /orders/_register_coid returns HTTP 200.
+        self._local_coid_index: dict[str, str] = {}
+
+        self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_attempts = 0
+        self._max_backoff = 15.0
+        self._intentional_close = False
+
+    @property
+    def account(self) -> str | None:
+        """Canonical base58 account from the edge after successful auth."""
+        return self._account
+
+    @property
+    def user_uuid(self) -> str | None:
+        """Deprecated compatibility alias for :attr:`account`."""
+        return self._account
+
+    @property
+    def account_id(self) -> str | None:
+        """Docs ``op: login`` account identifier, when supplied by the edge."""
+        return self._account_id
+
+    @property
+    def login_session_id(self) -> str | None:
+        """Docs ``op: login`` session identifier, when supplied by the edge."""
+        return self._login_session_id
+
+    @property
+    def token_expires_at(self) -> str | None:
+        """Docs ``op: login`` token expiry timestamp, when supplied by the edge."""
+        return self._token_expires_at
+
+    @property
+    def cancel_on_disconnect(self) -> bool:
+        """Effective docs ``cancel_on_disconnect`` setting for this socket."""
+        return self._cancel_on_disconnect
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def connect(self) -> None:
+        """Connect, authenticate, and establish an HPKE session."""
+        self._intentional_close = False
+
+        if not self._user_symbol_map:
+            from .rest_client import _ws_origin_to_http_rest
+
+            self._symbol_map, self._decimals_map = await load_instruments_from_edge(
+                _ws_origin_to_http_rest(self._base_url)
+            )
+
+        await self._transport.connect()
+        self._transport.on_encrypted_push = self._handle_encrypted_push
+        self._transport.on_public_message = self._handle_public_message
+        self._transport.on_rekey_required = lambda msg: asyncio.create_task(self._handle_rekey(msg))
+        self._transport.on_disconnect = self._on_transport_disconnect
+        self._transport.on_stale = self._on_transport_stale
+
+        auth_token = await self._resolve_ws_login_token()
+        auth_result = await self._transport.authenticate(auth_token)
+        if not auth_result.get("success"):
+            await self._transport.disconnect()
+            raise AuthenticationError(auth_result.get("error", "authentication failed"))
+
+        account = auth_result.get("account") or self._config_account
+        if account is None:
+            await self._transport.disconnect()
+            raise AuthenticationError(
+                "authentication succeeded but account missing in auth_result "
+                "and no fallback provided via constructor or "
+                "GODARK_ACCOUNT / GDX_ACCOUNT env vars"
+            )
+        self._account = str(account)
+        try:
+            _identity.account_to_bytes(self._account)
+        except ValueError as exc:
+            await self._transport.disconnect()
+            raise AuthenticationError(f"invalid account in auth_result: {exc}") from exc
+        self._account_id = (
+            str(auth_result["account_id"]) if auth_result.get("account_id") is not None else None
+        )
+        self._login_session_id = (
+            str(auth_result["session_id"]) if auth_result.get("session_id") is not None else None
+        )
+        self._token_expires_at = (
+            str(auth_result["token_expires_at"])
+            if auth_result.get("token_expires_at") is not None
+            else None
+        )
+        self._cancel_on_disconnect = bool(auth_result.get("cancel_on_disconnect", False))
+
+        try:
+            self._conn_id = int(auth_result["conn_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            await self._transport.disconnect()
+            raise AuthenticationError(
+                "auth response missing non-zero conn_id (required for HPKE)"
+            ) from exc
+        if self._conn_id == 0:
+            await self._transport.disconnect()
+            raise AuthenticationError("auth response missing non-zero conn_id (required for HPKE)")
+
+        await self._setup_hpke_session()
+        self._connected = True
+        self._reconnect_attempts = 0
+        logger.info("GodarkClient connected and authenticated")
+
+    async def disconnect(self) -> None:
+        """Gracefully disconnect."""
+        self._intentional_close = True
+        self._connected = False
+        self._clear_place_outcomes(ConnectionError("Disconnected before book confirmation"))
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
+        await self._transport.disconnect()
+        self._pending_encrypted_by_nonce.clear()
+        self._session.reset()
+
+    async def logout(self) -> None:
+        """Send docs ``op: logout`` when available, then close the WebSocket."""
+        self._intentional_close = True
+        try:
+            if self._connected and self._transport.use_docs_wire:
+                await self._transport.send_command(
+                    {"id": str(uuid.uuid4()), "op": "logout", "args": {}}
+                )
+        finally:
+            await self.disconnect()
+
+    async def __aenter__(self) -> GodarkClient:
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.disconnect()
+
+    # ------------------------------------------------------------------
+    # Trading
+    # ------------------------------------------------------------------
+
+    async def place_order(
+        self,
+        symbol: str,
+        side: str | Side,
+        order_type: str | OrderType,
+        quantity: str | None = None,
+        price: str | None = None,
+        time_in_force: str | TimeInForce = "GTC",
+        aon: bool = False,
+        min_fill_size: str | None = None,
+        expiry_time: int | None = None,
+        confirmation: Literal["ack", "book"] = "book",
+        options: PlaceOrderOptions | None = None,
+        client_order_id: str | None = None,
+    ) -> OrderAck:
+        """Place an order with explicit acknowledgement or book confirmation.
+
+        ``confirmation="ack"`` returns as soon as the sequencer acknowledges the
+        request. ``confirmation="book"`` (the default) waits for the subsequent
+        OPEN, REJECTED, FILLED, PARTIALLY_FILLED, or CANCELLED order update.
+
+        When ``client_order_id`` is set, a successful place is followed by
+        ``POST /api/v1/orders/_register_coid``. The edge only accepts that
+        mapping for a WebSocket place, which arms the header correlation.
+        ``correlation_id`` is the decimal u128 of that same header id, and
+        ``order_id`` is the decimal sequencer id. A non-2xx response, including
+        400, is raised. The in-memory coid cache is written only after HTTP 200.
+        """
+        if confirmation not in ("ack", "book"):
+            raise ValueError("confirmation must be 'ack' or 'book'")
+        self._ensure_ready()
+        symbol_id = self._resolve_symbol(symbol)
+        side_str = side.value if isinstance(side, Side) else side
+        otype_str = order_type.value if isinstance(order_type, OrderType) else order_type
+        tif_str = time_in_force.value if isinstance(time_in_force, TimeInForce) else time_in_force
+        corr_id = _new_correlation_id()
+
+        plaintext = _proto.build_place_order_proto(
+            symbol_id=symbol_id,
+            side=side_str,
+            order_type=otype_str,
+            quantity=quantity,
+            account=self._account_bytes(),
+            price=price,
+            time_in_force=tif_str,
+            aon=aon,
+            min_fill_size=min_fill_size,
+            expiry_time=expiry_time,
+            correlation_id_bytes=corr_id,
+            options=options,
+            timestamp=_timestamp_ns(),
+            scale=self._resolve_scale(symbol),
+        )
+
+        waiter = self._register_place_outcome_waiter() if confirmation == "book" else None
+        try:
+            ack = await self._send_encrypted_order("place", symbol_id, plaintext, corr_id)
+        except BaseException:
+            self._cancel_place_outcome_waiter(waiter)
+            raise
+
+        if waiter is not None:
+            update = await self._await_place_outcome(ack.order_id, waiter)
+            if (
+                update.update_type == OrderUpdateType.REJECTED
+                or update.status == OrderStatus.REJECTED
+            ):
+                raise make_order_error_from_json(update.msg, update.reject_reason)
+        if client_order_id and str(client_order_id).strip() and ack.success and ack.order_id:
+            await self._register_client_order_id(str(client_order_id), str(ack.order_id), corr_id)
+        return ack
+
+    async def _register_client_order_id(
+        self, client_order_id: str, order_id: str, correlation_id: bytes
+    ) -> None:
+        """Push the cleartext coid map. Cache it only when the edge stores it."""
+        from ._rest_transport import RestTransport
+        from .rest_client import _correlation_id_decimal, _ws_origin_to_http_rest
+
+        corr = _correlation_id_decimal(correlation_id)
+        if not corr:
+            raise OrderError("place correlation_id missing; cannot register client_order_id")
+        if not self._auth_token:
+            raise SessionError("not authenticated")
+        order_id_dec = str(order_id).strip()
+        if not order_id_dec.isdecimal():
+            raise OrderError("order_id must be a decimal string to register client_order_id")
+        http = RestTransport(_ws_origin_to_http_rest(self._base_url))
+        try:
+            await http.register_client_order_mapping(
+                bearer=self._auth_token,
+                client_order_id=client_order_id,
+                order_id=order_id_dec,
+                correlation_id=corr,
+            )
+        finally:
+            await http.aclose()
+        self._local_coid_index[client_order_id] = order_id_dec
+
+    async def cancel_order(self, order_id: str, symbol: str = "BTC-USDC-PERP") -> OrderAck:
+        """Cancel an order by ID."""
+        self._ensure_ready()
+        symbol_id = self._resolve_symbol(symbol)
+        corr_id = _new_correlation_id()
+
+        plaintext = _proto.build_cancel_order_proto(
+            order_id=int(order_id),
+            account=self._account_bytes(),
+            symbol_id=symbol_id,
+            correlation_id_bytes=corr_id,
+        )
+
+        return await self._send_encrypted_order("cancel", symbol_id, plaintext, corr_id)
+
+    async def modify_order(
+        self,
+        order_id: str,
+        symbol: str = "BTC-USDC-PERP",
+        new_price: str | None = None,
+        new_quantity: str | None = None,
+        new_trigger_price: str | None = None,
+    ) -> OrderAck:
+        """Modify an existing order's price and/or quantity (decimal strings)."""
+        self._ensure_ready()
+        symbol_id = self._resolve_symbol(symbol)
+        corr_id = _new_correlation_id()
+
+        plaintext = _proto.build_modify_order_proto(
+            order_id=int(order_id),
+            account=self._account_bytes(),
+            symbol_id=symbol_id,
+            new_price=new_price,
+            new_quantity=new_quantity,
+            new_trigger_price=new_trigger_price,
+            correlation_id_bytes=corr_id,
+            scale=self._resolve_scale(symbol),
+        )
+
+        return await self._send_encrypted_order("modify", symbol_id, plaintext, corr_id)
+
+    async def update_leverage(self, symbol: str, leverage: int) -> OrderAck:
+        """Set per-symbol account leverage over encrypted WebSocket (HPKE).
+
+        Place and mass-quote inherit this setting server-side. Uses the legacy
+        ``encrypted_order`` binary frame (docs-wire has no ``update_leverage`` op).
+        """
+        self._ensure_ready()
+        symbol_id = self._resolve_symbol(symbol)
+        corr_id = _new_correlation_id()
+        plaintext = _proto.build_update_leverage_proto(
+            account=self._account_bytes(),
+            symbol_id=symbol_id,
+            leverage=leverage,
+            correlation_id_bytes=corr_id,
+        )
+        response = await self._send_encrypted_command(
+            "update_leverage",
+            "update_leverage",
+            symbol_id,
+            plaintext,
+            corr_id,
+        )
+        return self._parse_order_response(response)
+
+    async def cancel_all_orders(self, symbol: str | None = None) -> CountAck:
+        """Cancel all open orders. When ``symbol`` is ``None``, cancels every market."""
+        self._ensure_ready()
+        header_symbol_id = self._resolve_symbol(symbol) if symbol is not None else 0
+        body_symbol_id = self._resolve_symbol(symbol) if symbol is not None else None
+        corr_id = _new_correlation_id()
+        plaintext = _proto.build_cancel_all_proto(
+            body_symbol_id,
+            self._account_bytes(),
+            corr_id,
+        )
+        response = await self._send_encrypted_command(
+            "cancel_all", "order.cancel_all", header_symbol_id, plaintext, corr_id
+        )
+        return self._parse_count_ack_response(response, "cancel_all_ack")
+
+    async def close_all(self, symbol: str | None = None) -> CountAck:
+        """Close all positions at market (reduce-only IOC). Scoped when ``symbol`` is set."""
+        self._ensure_ready()
+        header_symbol_id = self._resolve_symbol(symbol) if symbol is not None else 0
+        body_symbol_id = self._resolve_symbol(symbol) if symbol is not None else None
+        corr_id = _new_correlation_id()
+        plaintext = _proto.build_close_all_proto(
+            body_symbol_id,
+            self._account_bytes(),
+            corr_id,
+        )
+        response = await self._send_encrypted_command(
+            "close_all", "order.close_all", header_symbol_id, plaintext, corr_id
+        )
+        return self._parse_count_ack_response(response, "close_all_ack")
+
+    async def reverse_position(self, symbol: str) -> CountAck:
+        """Reverse the open position on ``symbol`` (flatten + open opposite side)."""
+        self._ensure_ready()
+        symbol_id = self._resolve_symbol(symbol)
+        corr_id = _new_correlation_id()
+        plaintext = _proto.build_reverse_proto(
+            symbol_id,
+            self._account_bytes(),
+            corr_id,
+        )
+        response = await self._send_encrypted_command(
+            "reverse", "order.reverse", symbol_id, plaintext, corr_id
+        )
+        return self._parse_count_ack_response(response, "reverse_ack")
+
+    async def amend_tpsl(
+        self,
+        symbol: str,
+        order_id: str | int,
+        *,
+        take_profit_price: str | None = None,
+        stop_loss_price: str | None = None,
+        position_side: str | Side | None = None,
+    ) -> TpslAck:
+        """Amend / attach TP-SL on a resting order or open position."""
+        self._ensure_ready()
+        symbol_id = self._resolve_symbol(symbol)
+        oid = int(order_id)
+        if oid == 0 and position_side is None:
+            raise ValueError("position_side is required when order_id is 0")
+        corr_id = _new_correlation_id()
+        body_symbol_id = symbol_id if oid == 0 else None
+        plaintext = _proto.build_amend_tpsl_proto(
+            self._account_bytes(),
+            oid,
+            corr_id,
+            take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price,
+            symbol_id=body_symbol_id,
+            position_side=position_side,
+            scale=self._resolve_scale(symbol),
+        )
+        response = await self._send_encrypted_command(
+            "amend_tpsl", "amend_tpsl", symbol_id, plaintext, corr_id
+        )
+        return self._parse_tpsl_ack_response(response)
+
+    async def cancel_tpsl(
+        self,
+        symbol: str,
+        order_id: str | int,
+        *,
+        position_side: str | Side | None = None,
+    ) -> TpslAck:
+        """Cancel TP/SL without cancelling the parent entry or flattening the position."""
+        self._ensure_ready()
+        symbol_id = self._resolve_symbol(symbol)
+        oid = int(order_id)
+        if oid == 0 and position_side is None:
+            raise ValueError("position_side is required when order_id is 0")
+        corr_id = _new_correlation_id()
+        body_symbol_id = symbol_id if oid == 0 else None
+        plaintext = _proto.build_cancel_tpsl_proto(
+            self._account_bytes(),
+            oid,
+            corr_id,
+            symbol_id=body_symbol_id,
+            position_side=position_side,
+        )
+        response = await self._send_encrypted_command(
+            "cancel_tpsl", "cancel_tpsl", symbol_id, plaintext, corr_id
+        )
+        return self._parse_tpsl_ack_response(response)
+
+    async def mass_quote(
+        self,
+        symbol: str,
+        legs: list[dict],
+        leverage: int = 1,
+        post_only: bool | None = None,
+    ) -> MassQuoteAck:
+        """Bulk cancel-replace (market-maker mass quote).
+
+        Each ``leg`` is a dict with: ``side`` ("BUY"/"SELL" or :class:`Side`),
+        ``price`` (decimal ``str``), ``quantity`` (decimal ``str``), optional
+        ``cancel_order_id`` (int; omit/0 = pure place), ``time_in_force``
+        ("GTC"/"GTD", default GTC), ``expiry_time`` (ns, GTD only). Up to 20
+        legs per batch, single symbol.
+
+        ``post_only`` controls the batch matching mode. Left as ``None`` (the
+        default) every replacement is post-only: a leg that would cross is
+        rejected as ``failed``, which lets the whole batch fuse into one MPC
+        round. Pass ``post_only=False`` for the relaxed path, where a crossing
+        leg instead takes liquidity up to its limit and rests the remainder; the
+        number of taker fills is reported per leg as ``fill_count``. Both modes
+        keep online MPC rounds flat in the number of legs.
+
+        Returns a :class:`MassQuoteAck` with one result per leg.
+        """
+        self._ensure_ready()
+        symbol_id = self._resolve_symbol(symbol)
+        corr_id = _new_correlation_id()
+
+        plaintext = _proto.build_mass_quote_proto(
+            symbol_id=symbol_id,
+            account=self._account_bytes(),
+            legs=legs,
+            correlation_id_bytes=corr_id,
+            leverage=leverage,
+            post_only=post_only,
+            scale=self._resolve_scale(symbol),
+        )
+        response = await self._send_encrypted_command(
+            "mass_quote", "order.mass_quote", symbol_id, plaintext, corr_id
+        )
+        return self._parse_mass_quote_response(response)
+
+    async def batch_cancel(
+        self,
+        symbol: str,
+        order_ids: list[int],
+    ) -> BatchCancelAck:
+        """Cancel multiple resting orders in a single fanned-out request.
+
+        ``order_ids`` is a list of resting order ids on one ``symbol`` (up to 20
+        per batch). Cancels are pure index removals (no MPC comparison), so the
+        whole batch costs zero online rounds regardless of count. Returns a
+        :class:`BatchCancelAck` with one result per id, in input order; an id
+        that is not resting is reported as ``cancelled=False`` (error_code 2003)
+        and never aborts the rest of the batch.
+        """
+        self._ensure_ready()
+        symbol_id = self._resolve_symbol(symbol)
+        corr_id = _new_correlation_id()
+
+        plaintext = _proto.build_batch_cancel_proto(
+            symbol_id=symbol_id,
+            account=self._account_bytes(),
+            order_ids=order_ids,
+            correlation_id_bytes=corr_id,
+        )
+        response = await self._send_encrypted_command(
+            "batch_cancel", "order.batch_cancel", symbol_id, plaintext, corr_id
+        )
+        return self._parse_batch_cancel_response(response)
+
+    async def batch_modify(
+        self,
+        symbol: str,
+        legs: list[dict],
+    ) -> BatchModifyAck:
+        """Amend multiple resting orders in a single fanned-out post-only request.
+
+        ``legs`` is a list of dicts on one ``symbol`` (up to 20 per batch); each
+        leg supports ``order_id`` (int, required), ``new_price`` (decimal
+        ``str``|None) and ``new_quantity`` (decimal ``str``|None) — at least one
+        of the two must be set.
+        Amends are post-only: a leg whose amended order would cross is rejected
+        (``modified=False``, error_code 2018) rather than taking liquidity, and a
+        missing order id is reported ``modified=False`` (error_code 2003); neither
+        aborts the rest of the batch. Returns a :class:`BatchModifyAck` with one
+        result per leg, in input order.
+        """
+        self._ensure_ready()
+        symbol_id = self._resolve_symbol(symbol)
+        corr_id = _new_correlation_id()
+
+        plaintext = _proto.build_batch_modify_proto(
+            symbol_id=symbol_id,
+            account=self._account_bytes(),
+            legs=legs,
+            correlation_id_bytes=corr_id,
+            scale=self._resolve_scale(symbol),
+        )
+        response = await self._send_encrypted_command(
+            "batch_modify", "order.batch_modify", symbol_id, plaintext, corr_id
+        )
+        return self._parse_batch_modify_response(response)
+
+    # ------------------------------------------------------------------
+    # Subscriptions & streaming
+    # ------------------------------------------------------------------
+
+    async def subscribe(
+        self, channels: tuple[str, ...] | list[str] = ("orders", "positions")
+    ) -> None:
+        """Subscribe to private and/or public edge channels.
+
+        Private (HPKE encrypted): ``orders``, ``positions``, etc.
+        Public (JSON snapshot): ``funding_rate``, ``volume``, ``open_interest``.
+        """
+        self._ensure_ready()
+        ch_list = list(channels)
+        for c in ch_list:
+            self._desired_channels.add(c)
+        await self._transport.send_subscribe(ch_list)
+
+    async def unsubscribe(
+        self, channels: tuple[str, ...] | list[str] = ("orders", "positions")
+    ) -> None:
+        """Unsubscribe from channels."""
+        ch_list = list(channels)
+        for c in ch_list:
+            self._desired_channels.discard(c)
+        if self._transport.is_connected:
+            await self._transport.send_subscribe(ch_list, op="unsubscribe")
+
+    async def order_updates(self) -> AsyncIterator[OrderUpdate]:
+        """Async iterator yielding order updates as they arrive."""
+        async for u in self._queue_iter(self._order_queue):
+            yield u
+
+    async def position_updates(self) -> AsyncIterator[PositionUpdate]:
+        """Async iterator yielding position updates as they arrive."""
+        async for u in self._queue_iter(self._position_queue):
+            yield u
+
+    async def leverage_settings_updates(self) -> AsyncIterator[LeverageSettings]:
+        """Async iterator yielding leverage settings pushes."""
+        async for u in self._queue_iter(self._leverage_settings_queue):
+            yield u
+
+    async def _queue_iter(self, queue: asyncio.Queue[TStream]) -> AsyncIterator[TStream]:
+        while self._connected or not queue.empty():
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=1.0)
+                yield item
+            except asyncio.TimeoutError:
+                continue
+
+    def on_order_update(self, callback: Callable[[OrderUpdate], None]) -> None:
+        """Register a callback for order updates."""
+        self._order_callbacks.append(callback)
+
+    def on_position_update(self, callback: Callable[[PositionUpdate], None]) -> None:
+        """Register a callback for position updates."""
+        self._position_callbacks.append(callback)
+
+    def on_positions_snapshot(self, callback: Callable[[PositionsSnapshot], None]) -> None:
+        """Register for full positions batches (initial / periodic / event)."""
+        self._positions_snapshot_callbacks.append(callback)
+
+    def on_system_health(self, callback: Callable[[SystemHealthUpdate], None]) -> None:
+        """Register for sequencer / MPC cluster health pulses."""
+        self._system_health_callbacks.append(callback)
+
+    def on_balance_update(self, callback: Callable[[BalanceUpdate], None]) -> None:
+        """Register for shielded balance updates."""
+        self._balance_callbacks.append(callback)
+
+    def on_margin_alert(self, callback: Callable[[MarginAlert], None]) -> None:
+        """Register for margin-tier transitions.
+
+        The current edge does not emit ``margin_alert``. Account margin arrives
+        as ``account_margin_update``; use :meth:`on_account_margin`.
+        """
+        self._margin_alert_callbacks.append(callback)
+
+    def on_account_margin(self, callback: Callable[[AccountMarginUpdate], None]) -> None:
+        """Register for encrypted ``account_margin_update`` pushes."""
+        self._account_margin_callbacks.append(callback)
+
+    def on_funding_rate_update(self, callback: Callable[[FundingRateUpdate], None]) -> None:
+        """Register for per-symbol funding rate updates.
+
+        Delivered from the public ``funding_rate`` WS channel (``funding_rate_snapshot``
+        JSON). Subscribe with ``await client.subscribe([..., "funding_rate"])``.
+        """
+        self._funding_rate_callbacks.append(callback)
+
+    def on_volume_snapshot(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Register for public ``volume_snapshot`` pushes.
+
+        Delivered when ``volume`` is subscribed, including the snapshot embedded
+        in the subscribe ack. Subscribe with ``await client.subscribe([..., "volume"])``.
+        """
+        self._volume_callbacks.append(callback)
+
+    def on_open_interest_snapshot(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Register for public ``open_interest_snapshot`` pushes.
+
+        Subscribe with ``await client.subscribe([..., "open_interest"])``.
+        """
+        self._open_interest_callbacks.append(callback)
+
+    def on_open_orders_snapshot(self, callback: Callable[[OpenOrdersSnapshot], None]) -> None:
+        """Register for open-order book hydration batches."""
+        self._open_orders_snapshot_callbacks.append(callback)
+
+    def on_settlement_update(self, callback: Callable[[SettlementUpdate], None]) -> None:
+        """Register for settlement-batch lifecycle updates.
+
+        The current edge does not emit ``settlement_update``.
+        """
+        self._settlement_callbacks.append(callback)
+
+    def on_leverage_settings(self, callback: Callable[[LeverageSettings], None]) -> None:
+        """Register for per-symbol leverage settings pushes."""
+        self._leverage_settings_callbacks.append(callback)
+
+    async def positions_snapshots(self) -> AsyncIterator[PositionsSnapshot]:
+        """Iterate positions snapshot batches."""
+        async for u in self._queue_iter(self._positions_snapshot_queue):
+            yield u
+
+    async def open_orders_snapshots(self) -> AsyncIterator[OpenOrdersSnapshot]:
+        """Iterate open-order book hydration batches."""
+        async for u in self._queue_iter(self._open_orders_snapshot_queue):
+            yield u
+
+    async def system_health_updates(self) -> AsyncIterator[SystemHealthUpdate]:
+        async for u in self._queue_iter(self._system_health_queue):
+            yield u
+
+    async def balance_updates(self) -> AsyncIterator[BalanceUpdate]:
+        async for u in self._queue_iter(self._balance_queue):
+            yield u
+
+    async def margin_alerts(self) -> AsyncIterator[MarginAlert]:
+        async for u in self._queue_iter(self._margin_alert_queue):
+            yield u
+
+    async def account_margin_updates(self) -> AsyncIterator[AccountMarginUpdate]:
+        """Iterate encrypted ``account_margin_update`` pushes.
+
+        Same buffer as :meth:`on_account_margin`. A consumer must drain this
+        iterator or the callback; otherwise the capped queue drops the oldest
+        update once it is full.
+        """
+        async for u in self._queue_iter(self._account_margin_queue):
+            yield u
+
+    async def funding_rate_updates(self) -> AsyncIterator[FundingRateUpdate]:
+        async for u in self._queue_iter(self._funding_rate_queue):
+            yield u
+
+    async def volume_snapshots(self) -> AsyncIterator[dict[str, Any]]:
+        """Iterate public ``volume_snapshot`` messages."""
+        async for u in self._queue_iter(self._volume_queue):
+            yield u
+
+    async def open_interest_snapshots(self) -> AsyncIterator[dict[str, Any]]:
+        """Iterate public ``open_interest_snapshot`` messages."""
+        async for u in self._queue_iter(self._open_interest_queue):
+            yield u
+
+    async def settlement_updates(self) -> AsyncIterator[SettlementUpdate]:
+        async for u in self._queue_iter(self._settlement_queue):
+            yield u
+
+    def on_reconnect(self, callback: Callable[[], None]) -> None:
+        """Register a callback for reconnection events."""
+        self._reconnect_callbacks.append(callback)
+
+    def on_error(self, callback: Callable[[BaseException], None]) -> None:
+        """Register a callback for session / encryption / push-parse errors (non-fatal)."""
+        self._error_callbacks.append(callback)
+
+    def _emit_error(self, err: BaseException) -> None:
+        for cb in self._error_callbacks:
+            try:
+                cb(err)
+            except Exception:
+                logger.debug("on_error callback raised", exc_info=True)
+
+    def _bounded_put(self, queue: asyncio.Queue, item: Any) -> None:  # type: ignore[type-arg]
+        """Enqueue item; if full, drop the oldest entry (head) first."""
+        if queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+            logger.warning("Stream buffer full (maxsize=%d), oldest item dropped", queue.maxsize)
+        queue.put_nowait(item)
+
+    # ------------------------------------------------------------------
+    # Internals: HPKE session
+    # ------------------------------------------------------------------
+
+    async def _setup_hpke_session(self) -> None:
+        """Complete HPKE Base setup over the active WebSocket."""
+        if self._account is None or self._conn_id == 0:
+            raise SessionError("account and conn_id required before HPKE setup")
+        try:
+            remote_static = pinned_sequencer_static_pub(self._hpke_static_public_key_hex)
+        except ValueError as exc:
+            raise SessionError(str(exc)) from exc
+        try:
+            account = self._account_bytes()
+            encapped = self._session.setup(remote_static, account, self._conn_id)
+        except Exception as exc:
+            raise SessionError(f"HPKE setup failed: {exc}") from exc
+        from ._wire import encode_hpke_setup
+
+        try:
+            frame = encode_hpke_setup(account, self._conn_id, encapped)
+            reply = await self._transport.send_hpke_setup(frame)
+            if reply.get("established") is not True:
+                raise SessionError("HPKE setup not established")
+            reply_conn_id = reply.get("conn_id")
+            if reply_conn_id != self._conn_id:
+                raise SessionError(
+                    f"HPKE setup conn_id mismatch: expected {self._conn_id}, got {reply_conn_id}"
+                )
+            self._session.establish()
+        except SessionError:
+            self._session.abort_setup()
+            raise
+        except Exception as exc:
+            self._session.abort_setup()
+            raise SessionError(f"HPKE setup failed: {exc}") from exc
+        logger.info("HPKE session established (conn_id=%s)", self._conn_id)
+
+    # ------------------------------------------------------------------
+    # Internals: encrypted order pipeline
+    # ------------------------------------------------------------------
+
+    async def _send_encrypted_order(
+        self,
+        request_type: str,
+        symbol_id: int,
+        plaintext: bytes,
+        correlation_id: bytes = b"",
+    ) -> OrderAck:
+        """
+        Encrypt and send one trading command, awaiting its ack.
+
+        The transport serializes commands so **only one encrypted command may be
+        in flight at a time** (see :class:`~godark._transport.EdgeTransport`).
+        Concurrent calls to ``place_order`` / ``cancel_order`` / ``modify_order``
+        will wait on the same transport lock; do not expect parallel acks.
+        """
+        op_map = {"place": "order.place", "cancel": "order.cancel", "modify": "order.modify"}
+        response = await self._send_encrypted_command(
+            request_type, op_map[request_type], symbol_id, plaintext, correlation_id
+        )
+        return self._parse_order_response(response)
+
+    async def _send_encrypted_command(
+        self,
+        request_type: str,
+        docs_op: str,
+        symbol_id: int,
+        plaintext: bytes,
+        correlation_id: bytes = b"",
+    ) -> dict:
+        """Encrypt one edge command and await its raw transport response.
+
+        Shared by order place/cancel/modify, mass quote and batch cancel/modify.
+        ``request_type`` sets the encrypted ``OrderHeader`` request type (also used
+        as AES-GCM AAD); ``docs_op`` is the WS docs op string in docs-wire mode.
+        """
+        body_length = CryptoSession.body_length_for_plaintext(len(plaintext))
+        corr_id_str = correlation_id.hex() if len(correlation_id) == 16 else ""
+        expected_ack = _INFLIGHT_ACK_TYPE.get(request_type, "ack")
+
+        # Encryption assigns and advances the session send-nonce, so it must be
+        # atomic with the actual send to keep concurrent commands in nonce
+        # order on the wire. ``prepare`` runs under the transport send lock.
+        def _prepare() -> bytes:
+            nonce_counter = self._session.next_nonce
+            aad = _proto.build_order_header_aad(
+                account=self._account_bytes(),
+                symbol_id=symbol_id,
+                request_type_str=request_type,
+                nonce=nonce_counter,
+                body_length=body_length,
+                correlation_id=correlation_id,
+                conn_id=self._conn_id,
+            )
+            try:
+                actual_nonce, ciphertext = self._session.encrypt_order(aad, plaintext)
+            except Exception as e:
+                raise EncryptionError(f"Failed to encrypt order: {e}") from e
+
+            header = build_order_header_proto(
+                account=self._account_bytes(),
+                symbol_id=symbol_id,
+                request_type_str=request_type,
+                nonce=actual_nonce,
+                body_length=body_length,
+                correlation_id=correlation_id,
+                conn_id=self._conn_id,
+            )
+            return encode_encrypted_order(encrypted_order_request(header, ciphertext))
+
+        # Record the ack type this command expects, keyed by correlation id so
+        # concurrent commands don't clobber one another. Falls back to the
+        # single-slot field when no correlation id is present (legacy path).
+        if corr_id_str:
+            self._expected_ack_by_correlation[corr_id_str.lower()] = expected_ack
+        else:
+            self._inflight_response_type = expected_ack
+        try:
+            return await self._transport.send_binary_command(
+                prepare=_prepare,
+                correlation_id=corr_id_str,
+            )
+        finally:
+            if corr_id_str:
+                self._expected_ack_by_correlation.pop(corr_id_str.lower(), None)
+            else:
+                self._inflight_response_type = None
+
+    def _parse_order_response(self, msg: dict) -> OrderAck:
+        msg_type = msg.get("type")
+
+        if msg_type == "error":
+            raw_code = msg.get("error_code")
+            parsed_code: int | None = None
+            if isinstance(raw_code, int):
+                parsed_code = raw_code
+            elif isinstance(raw_code, str) and raw_code.strip().isdigit():
+                parsed_code = int(raw_code.strip())
+            if parsed_code is not None and is_ws_admit_code(parsed_code):
+                raise OrderError(
+                    resolve_ws_admit_message(parsed_code, msg.get("message", "request failed")),
+                    error_code=str(parsed_code),
+                )
+            raise make_order_error_from_json(msg.get("message"), msg.get("error_code"))
+
+        if msg_type == "ack":
+            if not msg.get("success"):
+                raw_code = msg.get("error_code")
+                raise make_order_error_from_json(
+                    msg.get("reject_text")
+                    or msg.get("msg")
+                    or msg.get("error")
+                    or msg.get("message"),
+                    str(raw_code) if raw_code is not None else None,
+                )
+            return OrderAck(
+                order_id=str(msg.get("order_id", "")),
+                success=True,
+                sequence=str(msg.get("sequence", "")),
+            )
+
+        if msg_type == "encrypted_push":
+            return self._decrypt_ack_push(msg)
+
+        raise OrderError(f"Unexpected response type: {msg_type}")
+
+    def _parse_mass_quote_response(self, msg: dict) -> MassQuoteAck:
+        msg_type = msg.get("type")
+        if msg_type == "error":
+            raise OrderError(msg.get("message", "unknown error"))
+        if msg_type != "encrypted_push":
+            raise OrderError(f"Unexpected mass quote response type: {msg_type}")
+
+        plaintext = self._decrypt_push_body(msg, "mass_quote_ack")
+
+        parsed = _proto.parse_mass_quote_ack(plaintext)
+        if parsed.get("type") != "mass_quote_ack":
+            reject = _proto.parse_node_response(plaintext)
+            if reject.get("type") == "ack" and not reject.get("success", True):
+                raise make_order_error_from_json(
+                    reject.get("reject_text") or reject.get("message"),
+                    str(reject["error_code"]) if reject.get("error_code") is not None else None,
+                )
+            raise OrderError(f"Expected mass_quote_ack, got {parsed.get('type')}")
+
+        results = [
+            MassQuoteLegResult(
+                leg_index=r["leg_index"],
+                status=r["status"],
+                cancelled_order_id=(
+                    str(r["cancelled_order_id"]) if r["cancelled_order_id"] else None
+                ),
+                new_order_id=str(r["new_order_id"]) if r["new_order_id"] else None,
+                error_code=r["error_code"],
+                fill_count=r.get("fill_count", 0),
+            )
+            for r in parsed.get("results", [])
+        ]
+        success = bool(results) and all(r.status != "failed" for r in results)
+        return MassQuoteAck(
+            success=success,
+            sequence=str(parsed.get("sequence", "")),
+            results=results,
+        )
+
+    def _parse_batch_cancel_response(self, msg: dict) -> BatchCancelAck:
+        msg_type = msg.get("type")
+        if msg_type == "error":
+            raise OrderError(msg.get("message", "unknown error"))
+        if msg_type != "encrypted_push":
+            raise OrderError(f"Unexpected batch cancel response type: {msg_type}")
+
+        plaintext = self._decrypt_push_body(msg, "batch_cancel_ack")
+
+        parsed = _proto.parse_batch_cancel_ack(plaintext)
+        if parsed.get("type") != "batch_cancel_ack":
+            reject = _proto.parse_node_response(plaintext)
+            if reject.get("type") == "ack" and not reject.get("success", True):
+                raise make_order_error_from_json(
+                    reject.get("reject_text") or reject.get("message"),
+                    str(reject["error_code"]) if reject.get("error_code") is not None else None,
+                )
+            raise OrderError(f"Expected batch_cancel_ack, got {parsed.get('type')}")
+
+        results = [
+            BatchCancelLegResult(
+                order_id=str(r["order_id"]),
+                cancelled=r["cancelled"],
+                error_code=r["error_code"],
+            )
+            for r in parsed.get("results", [])
+        ]
+        success = bool(results) and all(r.cancelled for r in results)
+        return BatchCancelAck(
+            success=success,
+            sequence=str(parsed.get("sequence", "")),
+            results=results,
+        )
+
+    def _parse_batch_modify_response(self, msg: dict) -> BatchModifyAck:
+        msg_type = msg.get("type")
+        if msg_type == "error":
+            raise OrderError(msg.get("message", "unknown error"))
+        if msg_type != "encrypted_push":
+            raise OrderError(f"Unexpected batch modify response type: {msg_type}")
+
+        plaintext = self._decrypt_push_body(msg, "batch_modify_ack")
+
+        parsed = _proto.parse_batch_modify_ack(plaintext)
+        if parsed.get("type") != "batch_modify_ack":
+            reject = _proto.parse_node_response(plaintext)
+            if reject.get("type") == "ack" and not reject.get("success", True):
+                raise make_order_error_from_json(
+                    reject.get("reject_text") or reject.get("message"),
+                    str(reject["error_code"]) if reject.get("error_code") is not None else None,
+                )
+            raise OrderError(f"Expected batch_modify_ack, got {parsed.get('type')}")
+
+        results = [
+            BatchModifyLegResult(
+                order_id=str(r["order_id"]),
+                modified=r["modified"],
+                error_code=r["error_code"],
+            )
+            for r in parsed.get("results", [])
+        ]
+        success = bool(results) and all(r.modified for r in results)
+        return BatchModifyAck(
+            success=success,
+            sequence=str(parsed.get("sequence", "")),
+            results=results,
+        )
+
+    def _parse_count_ack_response(self, msg: dict, message_type: str) -> CountAck:
+        msg_type = msg.get("type")
+        if msg_type == "error":
+            raise OrderError(msg.get("message", "unknown error"))
+        if msg_type != "encrypted_push":
+            raise OrderError(f"Unexpected count ack response type: {msg_type}")
+
+        plaintext = self._decrypt_push_body(msg, message_type)
+        parsed = _proto.parse_count_ack(plaintext, message_type)
+        if parsed.get("type") != message_type:
+            if parsed.get("type") == "ack" and not parsed.get("success", True):
+                raise make_order_error_from_json(
+                    parsed.get("reject_text") or parsed.get("message"),
+                    str(parsed["error_code"]) if parsed.get("error_code") is not None else None,
+                )
+            raise OrderError(f"Expected {message_type}, got {parsed.get('type')}")
+        if parsed.get("error_code") is not None:
+            raise make_order_error_from_json(
+                parsed.get("reject_text"),
+                str(parsed["error_code"]),
+            )
+        return CountAck(
+            sequence=str(parsed.get("sequence", "")),
+            count=int(parsed.get("count", 0)),
+            order_ids=tuple(parsed.get("order_ids", [])),
+            error_code=parsed.get("error_code"),
+            reject_text=parsed.get("reject_text"),
+        )
+
+    def _parse_tpsl_ack_response(self, msg: dict) -> TpslAck:
+        msg_type = msg.get("type")
+        if msg_type == "error":
+            raise OrderError(msg.get("message", "unknown error"))
+        if msg_type != "encrypted_push":
+            raise OrderError(f"Unexpected tpsl ack response type: {msg_type}")
+
+        plaintext = self._decrypt_push_body(msg, "tpsl_ack")
+        parsed = _proto.parse_tpsl_ack(plaintext)
+        if parsed.get("type") != "tpsl_ack":
+            if parsed.get("type") == "ack" and not parsed.get("success", True):
+                raise make_order_error_from_json(
+                    parsed.get("reject_text") or parsed.get("message"),
+                    str(parsed["error_code"]) if parsed.get("error_code") is not None else None,
+                )
+            raise OrderError(f"Expected tpsl_ack, got {parsed.get('type')}")
+        if parsed.get("error_code") is not None:
+            raise make_order_error_from_json(
+                parsed.get("reject_text"),
+                str(parsed["error_code"]),
+            )
+        return TpslAck(
+            parent_order_id=str(parsed.get("parent_order_id", "")),
+            take_profit=parsed.get("take_profit"),
+            stop_loss=parsed.get("stop_loss"),
+            error_code=parsed.get("error_code"),
+            reject_text=parsed.get("reject_text"),
+        )
+
+    def _decrypt_ack_push(self, msg: dict) -> OrderAck:
+        if msg.get("_decrypt_error"):
+            raise EncryptionError(f"Failed to decrypt ack: {msg['_decrypt_error']}")
+        try:
+            plaintext = self._decrypt_push_body(msg, "ack")
+        except Exception as e:
+            raise EncryptionError(f"Failed to decrypt ack: {e}") from e
+
+        ack_dict = _proto.parse_node_response(plaintext)
+        if ack_dict.get("type") != "ack":
+            raise OrderError(f"Expected ack, got {ack_dict.get('type')}")
+
+        if not ack_dict.get("success"):
+            raw_code = ack_dict.get("error_code")
+            ec = raw_code if raw_code is not None else ""
+            raise make_order_error_from_json(
+                ack_dict.get("reject_text"),
+                str(ec) if ec != "" else None,
+            )
+
+        return OrderAck(
+            order_id=str(ack_dict.get("order_id", "")),
+            success=True,
+            sequence=str(ack_dict.get("sequence", "")),
+        )
+
+    def _decrypt_push_body(self, msg: dict, default_message_type: str) -> bytes:
+        """Decrypt a HPKE-bound response, retaining pre-decrypted ordered acks."""
+        cached = msg.get("_decrypted_plaintext")
+        if isinstance(cached, bytes):
+            return cached
+        ct = base64.b64decode(msg.get("encrypted_body", ""))
+        nonce = int(msg.get("nonce", 0))
+        aad = _proto.build_response_header_aad(
+            account=self._account_bytes(),
+            message_type_str=msg.get("message_type", default_message_type),
+            body_length=len(ct),
+            nonce=nonce,
+            fencing_epoch=msg.get("fencing_epoch", 0),
+            correlation_id=_proto.response_correlation_id_bytes(msg.get("correlation_id")),
+            session_seq=int(msg.get("session_seq") or 0),
+            conn_id=int(msg.get("conn_id") or self._conn_id),
+        )
+        return self._session.decrypt_push(nonce, aad, ct)
+
+    # ------------------------------------------------------------------
+    # Internals: push message handlers
+    # ------------------------------------------------------------------
+
+    def _handle_public_message(self, msg: dict) -> None:
+        typ = msg.get("type")
+        if typ == "volume_snapshot":
+            self._bounded_put(self._volume_queue, msg)
+            for cb in self._volume_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(msg)
+            return
+        if typ == "open_interest_snapshot":
+            self._bounded_put(self._open_interest_queue, msg)
+            for cb in self._open_interest_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(msg)
+            return
+        for update in _proto.parse_funding_rate_snapshot_json(msg):
+            self._dispatch_funding_rate_update(update)
+
+    def _dispatch_funding_rate_update(self, update: FundingRateUpdate) -> None:
+        if not update.funding_rate:
+            return
+        self._bounded_put(self._funding_rate_queue, update)
+        for cb in self._funding_rate_callbacks:
+            with contextlib.suppress(Exception):
+                cb(update)
+
+    def _handle_encrypted_push(self, msg: dict) -> None:
+        """Decrypt and dispatch an encrypted push frame."""
+        self._dispatch_encrypted_push_in_order(msg)
+
+    def _dispatch_encrypted_push_in_order(self, msg: dict) -> None:
+        message_type = msg.get("message_type", "")
+
+        if message_type in (
+            "ack",
+            "mass_quote_ack",
+            "batch_cancel_ack",
+            "batch_modify_ack",
+            "cancel_all_ack",
+            "close_all_ack",
+            "reverse_ack",
+            "tpsl_ack",
+        ):
+            # Resolve the in-flight command for any encrypted ack whose correlation
+            # id matches the waiter (matches Go/Rust). Reject acks for batch ops
+            # must surface to the caller instead of timing out.
+            try:
+                msg["_decrypted_plaintext"] = self._decrypt_push_body(msg, message_type)
+            except Exception as e:
+                msg["_decrypt_error"] = str(e)
+            self._transport.resolve_command(msg)
+            return
+
+        # Skip push types we don't have an AAD enum value for. The server
+        # may legitimately add new message types ahead of the SDK; logging
+        # at DEBUG and returning is the right behaviour. Without this guard
+        # an unknown type propagated a KeyError out of build_response_header_aad
+        # and silently killed the recv loop (= killed the WebSocket).
+        if message_type not in _RESPONSE_MESSAGE_TYPE_TO_PROTO:
+            logger.debug("Ignoring unknown encrypted push message_type=%r", message_type)
+            return
+
+        try:
+            plaintext = self._decrypt_push_body(msg, message_type)
+        except Exception as e:
+            err = EncryptionError(f"Failed to decrypt push: {e}")
+            err.__cause__ = e
+            logger.error("Failed to decrypt push: %s", e)
+            self._emit_error(err)
+            return
+
+        if message_type == "open_orders_snapshot":
+            # Bare OpenOrdersSnapshot (or legacy NodeResponse wrapper).
+            try:
+                snap = _proto.parse_open_orders_snapshot(plaintext)
+            except Exception as e:
+                err = GodarkError(f"Failed to parse open_orders_snapshot: {e}")
+                err.__cause__ = e
+                logger.error("Failed to parse open_orders_snapshot: %s", e)
+                self._emit_error(err)
+                return
+            self._dispatch_open_orders_snapshot(snap)
+            return
+
+        try:
+            parsed = _proto.parse_sequencer_to_edge_message(plaintext, message_type)
+        except Exception as e:
+            err = GodarkError(f"Failed to parse encrypted push body: {e}")
+            err.__cause__ = e
+            logger.error("Failed to parse encrypted push body: %s", e)
+            self._emit_error(err)
+            return
+
+        self._dispatch_sequencer_push(parsed)
+
+    def _dispatch_sequencer_push(self, parsed: _proto.SequencerPush) -> None:
+        """Route decrypted bare sequencer push variants to queues + callbacks."""
+        if isinstance(parsed, OrderUpdate):
+            self._observe_order_update(parsed)
+            self._bounded_put(self._order_queue, parsed)
+            for cb in self._order_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(parsed)
+            return
+
+        if isinstance(parsed, PositionUpdate):
+            self._bounded_put(self._position_queue, parsed)
+            for cb in self._position_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(parsed)
+            return
+
+        if isinstance(parsed, PositionsSnapshot):
+            self._bounded_put(self._positions_snapshot_queue, parsed)
+            for cb in self._positions_snapshot_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(parsed)
+            self._emit_position_rows_as_updates(parsed)
+            return
+
+        if isinstance(parsed, SystemHealthUpdate):
+            self._bounded_put(self._system_health_queue, parsed)
+            for cb in self._system_health_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(parsed)
+            return
+
+        if isinstance(parsed, BalanceUpdate):
+            self._bounded_put(self._balance_queue, parsed)
+            for cb in self._balance_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(parsed)
+            return
+
+        if isinstance(parsed, MarginAlert):
+            self._bounded_put(self._margin_alert_queue, parsed)
+            for cb in self._margin_alert_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(parsed)
+            return
+
+        if isinstance(parsed, AccountMarginUpdate):
+            self._bounded_put(self._account_margin_queue, parsed)
+            for cb in self._account_margin_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(parsed)
+            return
+
+        if isinstance(parsed, FundingRateUpdate):
+            self._dispatch_funding_rate_update(parsed)
+            return
+
+        if isinstance(parsed, SettlementUpdate):
+            self._bounded_put(self._settlement_queue, parsed)
+            for cb in self._settlement_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(parsed)
+            return
+
+        if isinstance(parsed, LeverageSettings):
+            self._bounded_put(self._leverage_settings_queue, parsed)
+            for cb in self._leverage_settings_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(parsed)
+            return
+
+        if isinstance(parsed, UnknownSequencerPush):
+            logger.debug(
+                "Ignoring sequencer push with unknown or empty inner (oneof=%r)",
+                parsed.oneof_field,
+            )
+
+    def _emit_position_rows_as_updates(self, snapshot: PositionsSnapshot) -> None:
+        """The live edge sends positions as a snapshot, not ``position_update``."""
+        for row in snapshot.rows:
+            update = PositionUpdate(
+                account=snapshot.account,
+                symbol_id=row.symbol_id,
+                side=row.side,
+                update_type=PositionUpdateType.SNAPSHOT,
+                size=row.size,
+                entry_price=row.entry_price,
+                previous_size="0",
+                fill_price=row.mark_price or "0",
+                fill_qty="0",
+                timestamp=snapshot.server_timestamp,
+            )
+            self._bounded_put(self._position_queue, update)
+            for cb in self._position_callbacks:
+                with contextlib.suppress(Exception):
+                    cb(update)
+
+    def _dispatch_open_orders_snapshot(self, snap: OpenOrdersSnapshot) -> None:
+        self._bounded_put(self._open_orders_snapshot_queue, snap)
+        for cb in self._open_orders_snapshot_callbacks:
+            with contextlib.suppress(Exception):
+                cb(snap)
+
+    @staticmethod
+    def _is_terminal_place_update(update: OrderUpdate) -> bool:
+        return update.update_type in {
+            OrderUpdateType.OPEN,
+            OrderUpdateType.REJECTED,
+            OrderUpdateType.FILLED,
+            OrderUpdateType.PARTIALLY_FILLED,
+            OrderUpdateType.CANCELLED,
+        } or update.status in {
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.REJECTED,
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+        }
+
+    def _register_place_outcome_waiter(self) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        waiter: dict[str, Any] = {
+            "order_id": None,
+            "future": loop.create_future(),
+        }
+        self._place_outcome_waiters.append(waiter)
+        return waiter
+
+    def _cancel_place_outcome_waiter(self, waiter: dict[str, Any] | None) -> None:
+        if waiter is None:
+            return
+        with contextlib.suppress(ValueError):
+            self._place_outcome_waiters.remove(waiter)
+        future = waiter["future"]
+        if not future.done():
+            future.cancel()
+        elif not future.cancelled():
+            with contextlib.suppress(BaseException):
+                future.exception()
+
+    async def _await_place_outcome(self, order_id: str, waiter: dict[str, Any]) -> OrderUpdate:
+        waiter["order_id"] = order_id
+        buffered = next(
+            (u for u in self._recent_terminal_updates if u.order_id == order_id),
+            None,
+        )
+        if buffered is not None and not waiter["future"].done():
+            waiter["future"].set_result(buffered)
+            self._recent_terminal_updates.remove(buffered)
+        try:
+            return await asyncio.wait_for(
+                waiter["future"], timeout=self._place_order_terminal_timeout
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                "place_order timed out waiting for terminal update after "
+                f"{self._place_order_terminal_timeout:g}s"
+            ) from exc
+        finally:
+            with contextlib.suppress(ValueError):
+                self._place_outcome_waiters.remove(waiter)
+
+    def _clear_place_outcomes(self, error: BaseException) -> None:
+        waiters, self._place_outcome_waiters = self._place_outcome_waiters, []
+        self._recent_terminal_updates.clear()
+        for waiter in waiters:
+            future = waiter["future"]
+            if not future.done():
+                future.set_exception(type(error)(str(error)))
+
+    def _observe_order_update(self, update: OrderUpdate) -> None:
+        if not self._is_terminal_place_update(update):
+            return
+        for waiter in self._place_outcome_waiters:
+            if waiter["order_id"] == update.order_id and not waiter["future"].done():
+                waiter["future"].set_result(update)
+                return
+        self._recent_terminal_updates.append(update)
+        if len(self._recent_terminal_updates) > 64:
+            self._recent_terminal_updates.pop(0)
+
+    # ------------------------------------------------------------------
+    # Internals: reconnect & rekey
+    # ------------------------------------------------------------------
+
+    async def _handle_rekey(self, msg: dict) -> None:
+        logger.info("Rekey required, re-negotiating HPKE session")
+        try:
+            self._session.reset()
+            self._pending_encrypted_by_nonce.clear()
+            await self._setup_hpke_session()
+        except Exception as e:
+            if isinstance(e, SessionError):
+                err: SessionError = e
+            else:
+                err = SessionError(f"Rekey failed: {e}")
+                err.__cause__ = e
+            logger.error("Rekey failed: %s", e)
+            self._emit_error(err)
+
+    def _on_transport_stale(self, reason: str) -> None:
+        self._emit_error(ConnectionError(reason))
+
+    def _on_transport_disconnect(self) -> None:
+        self._connected = False
+        self._pending_encrypted_by_nonce.clear()
+        self._clear_place_outcomes(ConnectionError("Disconnected before book confirmation"))
+        if self._intentional_close or not self._auto_reconnect:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+
+    async def _reconnect_loop(self) -> None:
+        while self._auto_reconnect and not self._intentional_close:
+            delay = min(1.0 * (2**self._reconnect_attempts), self._max_backoff)
+            self._reconnect_attempts += 1
+            logger.info("Reconnecting in %.1fs (attempt %d)", delay, self._reconnect_attempts)
+            await asyncio.sleep(delay)
+
+            try:
+                self._transport = EdgeTransport(_ws_url(self._base_url), self._transport_config)
+                self._session.reset()
+                await self.connect()
+
+                if self._desired_channels:
+                    await self.subscribe(list(self._desired_channels))
+
+                for cb in self._reconnect_callbacks:
+                    with contextlib.suppress(Exception):
+                        cb()
+
+                logger.info("Reconnected successfully")
+                return
+            except Exception as e:
+                logger.warning("Reconnect failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Internals: helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_ready(self) -> None:
+        if not self._connected:
+            raise ConnectionError("Not connected")
+        if self._account is None:
+            raise ConnectionError("Not authenticated")
+        if not self._session.is_established:
+            raise SessionError("HPKE session not established")
+
+    @staticmethod
+    def _parse_account_bytes(msg: dict) -> bytes:
+        """Extract account bytes from a push JSON message."""
+        raw = msg.get("account")
+        if isinstance(raw, str):
+            try:
+                return _identity.account_to_bytes(raw)
+            except ValueError:
+                pass
+        return b"\x00" * _identity.ACCOUNT_LEN
+
+    def _account_bytes(self) -> bytes:
+        """Return current account as 32 wire bytes."""
+        if self._account is None:
+            return b"\x00" * _identity.ACCOUNT_LEN
+        try:
+            return _identity.account_to_bytes(self._account)
+        except (ValueError, AttributeError):
+            return b"\x00" * _identity.ACCOUNT_LEN
+
+    def _resolve_symbol(self, symbol: str) -> int:
+        sid = self._symbol_map.get(symbol)
+        if sid is None:
+            raise ValueError(f"Unknown symbol '{symbol}'. Known: {list(self._symbol_map.keys())}")
+        return sid
+
+    def _resolve_scale(self, symbol: str) -> InstrumentDecimals:
+        scale = self._decimals_map.get(symbol)
+        if scale is not None:
+            return scale
+        # Conservative venue max when symbol decimals were not loaded.
+        return InstrumentDecimals(price_decimals=8, quantity_decimals=8)
+
+    async def _resolve_ws_login_token(self) -> str:
+        """Return the WebSocket login token (JWT for key triple, opaque for legacy)."""
+        if self._api_key_id is None:
+            if not self._auth_token:
+                raise AuthenticationError("missing login token")
+            return self._auth_token
+
+        from ._rest_transport import RestTransport
+        from .rest_client import _ws_origin_to_http_rest
+
+        http = RestTransport(_ws_origin_to_http_rest(self._base_url))
+        try:
+            auth_data = await http.auth_token(
+                grant_type="client_credentials",
+                client_id=self._api_key_id,
+                client_secret=self._api_secret,
+                passphrase=self._passphrase,
+            )
+        finally:
+            await http.aclose()
+
+        token = auth_data.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise AuthenticationError("auth/token response missing access_token")
+        self._auth_token = token
+        return token
