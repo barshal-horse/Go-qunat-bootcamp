@@ -20,7 +20,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          key: venv-${{ runner.os }}-${{ hashFiles('requirements.txt', 'sdk/pyproject.toml') }}
 
       - name: Install deps
         run: |
@@ -28,6 +28,7 @@ jobs:
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -r requirements.txt
           .venv/bin/pip install -e ./sdk
+          .venv/bin/python -c "import godark; print(godark.__file__)"
 
       - name: Run Agent
         env:
@@ -37,5 +38,5 @@ jobs:
           DRY_RUN: "false"
         run: |
           set -e
-          source .venv/bin/activate
-          timeout 340m python examples/quantitative_trading_agent.py
+          export PYTHONPATH="${GITHUB_WORKSPACE}/sdk:${PYTHONPATH:-}"
+          timeout 340m .venv/bin/python examples/quantitative_trading_agent.py
