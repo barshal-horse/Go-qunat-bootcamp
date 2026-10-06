@@ -12,11 +12,81 @@ import os
 import sys
 import signal
 import time
-from collections import deque
+import json
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP
 from typing import Dict, List, Optional, Tuple, Set, Deque
+from datetime import datetime
 
 import pandas as pd
+
+# --- Telegram Notifier ---
+class TelegramNotifier:
+    def __init__(self, bot_token: str, chat_id: str):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{bot_token}"
+        self.enabled = bool(bot_token and chat_id)
+    
+    async def send(self, text: str) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
+                ) as resp:
+                    return resp.status == 200
+        except Exception as e:
+            logging.warning(f"Telegram notification failed: {e}")
+            return False
+    
+    def format_trade(self, symbol: str, side: str, price: float, qty: float, 
+                     module: str, order_id: str = None, 
+                     sl: float = None, tp: float = None) -> str:
+        emoji = "🟢" if side == "BUY" else "🔴"
+        mod_name = {"A": "Trend", "B": "Grid", "C": "Funding", "D": "Breakout"}.get(module, module)
+        lines = [
+            f"{emoji} <b>Trade Executed</b> {emoji}",
+            f"<b>Symbol:</b> {symbol}",
+            f"<b>Side:</b> {side}",
+            f"<b>Price:</b> {price:,.8f}",
+            f"<b>Qty:</b> {qty}",
+            f"<b>Module:</b> {mod_name} ({module})",
+        ]
+        if sl:
+            lines.append(f"<b>SL:</b> {sl:,.8f}")
+        if tp:
+            lines.append(f"<b>TP:</b> {tp:,.8f}")
+        if order_id:
+            lines.append(f"<b>Order ID:</b> <code>{order_id}</code>")
+        lines.append(f"<b>Time:</b> {datetime.utcnow().strftime('%H:%M:%S UTC')}")
+        return "\n".join(lines)
+    
+    def format_grid(self, symbol: str, bid_price: float, ask_price: float, 
+                    qty: float, order_ids: list) -> str:
+        lines = [
+            f"📊 <b>Grid Placed</b> 📊",
+            f"<b>Symbol:</b> {symbol}",
+            f"<b>Bid:</b> {bid_price:,.8f} | <b>Ask:</b> {ask_price:,.8f}",
+            f"<b>Qty per leg:</b> {qty}",
+            f"<b>Orders:</b> {len(order_ids)} placed",
+            f"<b>Time:</b> {datetime.utcnow().strftime('%H:%M:%S UTC')}",
+        ]
+        return "\n".join(lines)
+    
+    def format_regime_switch(self, symbol: str, old_module: str, new_module: str, 
+                              regime: str) -> str:
+        mod_name = {"A": "Trend", "B": "Grid", "C": "Funding", "D": "Breakout"}
+        old_name = mod_name.get(old_module, old_module)
+        new_name = mod_name.get(new_module, new_module)
+        return (
+            f"🔄 <b>Regime Switch</b>\n"
+            f"<b>Symbol:</b> {symbol}\n"
+            f"<b>Regime:</b> {regime}\n"
+            f"<b>Module:</b> {old_name} → {new_name}"
+        )
 
 # Ensure local vendored godark package is importable
 try:
@@ -58,6 +128,11 @@ logging.basicConfig(
 load_dotenv()
 os.environ["GODARK_ENABLE_TRADES"] = "0"
 from godark import TransportConfig
+
+# Telegram notifier (uses env vars)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+telegram_notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 # Configure WebSocket transport for better resilience to server ping issues
 transport_config = TransportConfig(
@@ -228,6 +303,9 @@ class QuantitativeTradingAgent:
         self.oi_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=200) for s in SYMBOLS}  # (timestamp, oi)
         self.volume_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=200) for s in SYMBOLS}  # (timestamp, volume)
 
+        # Telegram notifier
+        self.telegram = telegram_notifier
+
     # -------------------------------------------------------------------------
     # Formatting Helpers
     # -------------------------------------------------------------------------
@@ -282,7 +360,8 @@ class QuantitativeTradingAgent:
     # Execution Engine
     # -------------------------------------------------------------------------
     async def place_directional_order(
-        self, symbol: str, side: str, price: float, qty: float, atr: float
+        self, symbol: str, side: str, price: float, qty: float, atr: float,
+        module: str = "A"
     ):
         p_str = self.format_price(symbol, price)
         q_str = self.format_qty(symbol, qty)
@@ -316,6 +395,15 @@ class QuantitativeTradingAgent:
                 options=opts,
             )
             logger.info(f"[{symbol}] Directional order placed successfully: {res}")
+            # Send Telegram notification
+            order_id = getattr(res, 'order_id', None)
+            if self.telegram.enabled:
+                msg = self.telegram.format_trade(
+                    symbol=symbol, side=side, price=price, qty=qty,
+                    module=module, order_id=order_id,
+                    sl=float(opts.stop_loss_price), tp=float(opts.take_profit_price)
+                )
+                await self.telegram.send(msg)
         except OrderError as e:
             logger.error(f"[{symbol}] Order Error (Code: {getattr(e, 'error_code', 'N/A')}): {e}")
 
@@ -481,7 +569,7 @@ class QuantitativeTradingAgent:
 
             await self.client.update_leverage(symbol, config["leverage"])
             qty = await self.calculate_risk_position_size(symbol, mid_price, atr)
-            await self.place_directional_order(symbol, "BUY", mid_price, qty, atr)
+            await self.place_directional_order(symbol, "BUY", mid_price, qty, atr, module="C")
             logger.info(f"[{symbol}] Module C (Funding) LONG: funding={funding:.6f}, RSI={rsi:.1f}")
 
         # SHORT: positive funding (longs pay shorts) + RSI not oversold
@@ -495,7 +583,7 @@ class QuantitativeTradingAgent:
 
             await self.client.update_leverage(symbol, config["leverage"])
             qty = await self.calculate_risk_position_size(symbol, mid_price, atr)
-            await self.place_directional_order(symbol, "SELL", mid_price, qty, atr)
+            await self.place_directional_order(symbol, "SELL", mid_price, qty, atr, module="C")
             logger.info(f"[{symbol}] Module C (Funding) SHORT: funding={funding:.6f}, RSI={rsi:.1f}")
 
     # -------------------------------------------------------------------------
@@ -527,7 +615,7 @@ class QuantitativeTradingAgent:
 
             await self.client.update_leverage(symbol, config["leverage"])
             qty = await self.calculate_risk_position_size(symbol, mid_price, latest["atr"])
-            await self.place_directional_order(symbol, "BUY", mid_price, qty, latest["atr"])
+            await self.place_directional_order(symbol, "BUY", mid_price, qty, latest["atr"], module="D")
             logger.info(f"[{symbol}] Module D (Breakout) LONG: OI_chg={oi_change:.2%}, vol_ratio={current_volume/avg_volume:.2f}")
 
         # SHORT: breakout lower + OI surge + volume confirmation
@@ -544,7 +632,7 @@ class QuantitativeTradingAgent:
 
             await self.client.update_leverage(symbol, config["leverage"])
             qty = await self.calculate_risk_position_size(symbol, mid_price, latest["atr"])
-            await self.place_directional_order(symbol, "SELL", mid_price, qty, latest["atr"])
+            await self.place_directional_order(symbol, "SELL", mid_price, qty, latest["atr"], module="D")
             logger.info(f"[{symbol}] Module D (Breakout) SHORT: OI_chg={oi_change:.2%}, vol_ratio={current_volume/avg_volume:.2f}")
 
     # -------------------------------------------------------------------------
