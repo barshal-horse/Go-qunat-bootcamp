@@ -5,3 +5,4 @@ pydantic
 websockets
 pyyaml
 python-dotenv
+protobuf>=7.35.1
