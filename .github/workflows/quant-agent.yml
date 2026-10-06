@@ -27,6 +27,7 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -r requirements.txt
+          .venv/bin/pip install "git+https://github.com/gq-godark/gdx-python-sdk-examples.git#subdirectory=sdk"
 
       - name: Run Agent
         env:
@@ -36,5 +37,4 @@ jobs:
           DRY_RUN: "false"
         run: |
           set -e
-          export PYTHONPATH="${GITHUB_WORKSPACE}/sdk:${PYTHONPATH:-}"
           timeout 340m .venv/bin/python examples/quantitative_trading_agent.py
