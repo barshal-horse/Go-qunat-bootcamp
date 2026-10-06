@@ -25,6 +25,7 @@ jobs:
       - name: Install deps
         run: |
           python -m venv .venv
+          .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -r requirements.txt
 
       - name: Run Agent
@@ -34,4 +35,5 @@ jobs:
           GODARK_PASSPHRASE: ${{ secrets.GODARK_PASSPHRASE }}
           DRY_RUN: "false"
         run: |
-          timeout 340m .venv/bin/python examples/quantitative_trading_agent.py || true
+          set -e
+          timeout 340m .venv/bin/python examples/quantitative_trading_agent.py

@@ -1,0 +1,7 @@
+pandas
+numpy
+httpx
+pydantic
+websockets
+pyyaml
+python-dotenv
