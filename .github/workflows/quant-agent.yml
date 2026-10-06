@@ -1,0 +1,37 @@
+name: GoDark Quant Agent (Bootcamp)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours UTC
+  workflow_dispatch:
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+
+      - name: Run Agent
+        env:
+          GODARK_API_KEY_ID: ${{ secrets.GODARK_API_KEY_ID }}
+          GODARK_API_SECRET: ${{ secrets.GODARK_API_SECRET }}
+          GODARK_PASSPHRASE: ${{ secrets.GODARK_PASSPHRASE }}
+          DRY_RUN: "false"
+        run: |
+          timeout 340m .venv/bin/python examples/quantitative_trading_agent.py || true
