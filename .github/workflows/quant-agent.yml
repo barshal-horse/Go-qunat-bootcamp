@@ -37,4 +37,5 @@ jobs:
           DRY_RUN: "false"
         run: |
           set -e
-          timeout 340m .venv/bin/python examples/quantitative_trading_agent.py
+          source .venv/bin/activate
+          timeout 340m python examples/quantitative_trading_agent.py
