@@ -7,3 +7,4 @@ pyyaml
 python-dotenv
 protobuf>=7.35.1
 pyhpke
+aiohttp
