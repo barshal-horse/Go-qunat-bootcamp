@@ -57,7 +57,7 @@ gdx-python-sdk-examples/
 ├── .gitignore
 ├── README.md
 └── examples/
-    ├── quantitative_trading_agent.py    # Main agent (1048 lines)
+    ├── quantitative_trading_agent.py    # Main agent (1253 lines)
     ├── dotenv.py                         # Env loader
     └── trade_safety.py                   # Safety utilities
 ```
@@ -84,12 +84,24 @@ gdx-python-sdk-examples/
 | 14 | **Complete Telegram hooks** | Trade, grid, regime switch notifications |
 | 15 | **TradeLogger class** | JSONL format trades.log + artifact upload |
 | 16 | **Artifact upload** | trades.log uploaded as 90-day artifact |
+| 17 | 401 storm from position sync | `sync_positions()` throttled to 5s + 401 re-auth retry |
+| 18 | Order pileup across restarts | Startup + shutdown `cancel_all_orders()` sweep |
+| 19 | Leverage acks unchecked | `_set_leverage()` checks ack, logs rejections |
+| 20 | Regime pinned to BREAKOUT | Regime priority: FUNDING > TREND > OI/volume BREAKOUT > MEAN_REV |
+| 21 | Funding handler never populated | `_resolve_event_symbol()` symbol_id fallback + REST seed at startup |
+| 22 | Handlers bound after subscribe | Market data handlers bound before `subscribe()` |
+| 23 | **Frozen mid price (stale OI-implied)** | Live mid from Hyperliquid `allMids` (venue has no price feed); OI-implied kept as fallback only |
+| 24 | POST_ONLY_WOULD_CROSS rejections (29/5min) | Fixed by #23 - zero occurrences since |
+| 25 | MARGIN_INSUFFICIENT on Module A entries | Size cap: 80% free collateral AND portfolio-heat budget ($24k); `free_collateral` preferred over total |
+| 26 | `entered_long` logged despite rejection | `place_directional_order()` returns bool; modules return `order_rejected` on failure |
+| 27 | UnicodeEncodeError killed log records | Replaced `→` with `->` (stderr is cp1252 on Windows) |
+| 28 | No startup/failure Telegram alerts | Startup alert (with sweep count + run URL), fatal-auth alert, backoff failure alert |
 
 ---
 
 ## Current File Status
 
-### `examples/quantitative_trading_agent.py` (1048 lines)
+### `examples/quantitative_trading_agent.py` (1253 lines)
 - ✅ Imports fixed (deque, aiohttp, json, datetime)
 - ✅ TradeLogger class added (JSONL format)
 - ✅ TelegramNotifier class added (HTML formatted)
@@ -107,7 +119,7 @@ gdx-python-sdk-examples/
 - ✅ Requirements: pandas, numpy, httpx, pydantic, websockets, pyyaml, python-dotenv, protobuf>=7.35.1, pyhpke, aiohttp
 - ✅ Upload trades.log as 90-day artifact
 - ✅ Uses upstream SDK (no local copy)
-- ⚠️ Still has `DRY_RUN: "false"` in env (needs removal)
+- ✅ No `DRY_RUN` env (removed; agent defaults `DRY_RUN=false`)
 
 ### `requirements.txt`
 ```
@@ -140,14 +152,15 @@ aiohttp
 
 | Issue | Status | Priority |
 |-------|--------|----------|
-| Remove `DRY_RUN: "false"` from workflow.yml | **PENDING** | High |
-| Verify Telegram secrets set in GitHub | **PENDING** | High |
-| Verify agent actually places trades (not just warmup) | **UNVERIFIED** | Critical |
-| Verify price data quality (ccy/oi from REST) | **UNVERIFIED** | High |
-| Verify regime detection triggers correctly | **UNVERIFIED** | High |
-| Verify trade execution on testnet | **UNVERIFIED** | Critical |
-| Verify Telegram alerts fire | **UNVERIFIED** | High |
-| Verify trade.log artifact uploads | **UNVERIFIED** | Medium |
+| Remove `DRY_RUN: "false"` from workflow.yml | **DONE** (absent from workflow) | High |
+| Verify agent actually places trades (not just warmup) | **VERIFIED** (21 Oct local runs: entries accepted, grids 4/4 legs, fills observed) | Critical |
+| Verify price data quality | **VERIFIED** - Hyperliquid live mid (ccy/oi fallback only) | High |
+| Verify regime detection triggers correctly | **VERIFIED** - TREND/MEAN_REV switching observed in logs | High |
+| Verify trade execution on testnet | **VERIFIED** - orders accepted, fills, PnL in positions | Critical |
+| Verify startup sweep cancels orphans | **VERIFIED** - cancelled 7 then 6 leftover orders on consecutive runs | Critical |
+| Verify Telegram alerts fire | **PENDING** - local has no secrets; test via manual workflow run | High |
+| Verify trade.log artifact uploads | **PENDING** - check after next workflow run | Medium |
+| Verify attached SL/TP triggers actually fire | **PENDING** - positions observed with SL/TP set but not yet hit | High |
 
 ---
 
@@ -190,23 +203,34 @@ aiohttp
 ## Known Gaps / To-Do
 
 ### Immediate (Before Next Run)
-1. **Remove DRY_RUN from workflow.yml** - Line 37 in quant-agent.yml
-2. **Verify Telegram secrets** are set in GitHub repo settings
-3. **Trigger manual run** to test new code with Telegram
+1. **Trigger manual workflow run** to verify Telegram secrets + artifact upload
+2. Watch first workflow logs for `Startup sweep` and `Seeded funding rates` lines
 
 ### Post-Deployment Verification
-1. **Check trade execution** - Verify orders placed on testnet
-2. **Verify Telegram alerts** - Check for trade/grid/regime messages
-3. **Check trades.log artifact** - Verify JSONL format
-4. **Monitor regime detection** - Ensure all 4 modules trigger
-5. **Monitor warmup time** - Should be ~40s (20 candles × 2s)
+1. **Verify Telegram alerts** - Check for startup alert + trade/grid/regime messages
+2. **Verify trades.log artifact** - Check JSONL format after run
+3. **Monitor attached SL/TP** - Module A entries carry SL/TP but triggers not yet observed firing
+4. **Monitor warmup time** - ~40s (20 ticks x 2s)
+
+### Known Design Gaps
+- **No exit logic for Modules A/B/D** - only Module C has a funding-normalized exit;
+  open positions rely on attached SL/TP triggers (verified as valid fields in docs,
+  firing not yet observed). Positions accumulate until heat gate blocks new entries.
+- **Regime churn** - EMA/RSI bands flip TREND <-> MEAN_REV within minutes, causing
+  grid clear/re-place cycles every 15s (36 order actions/min; well under the 1,800
+  credits/min Core-tier limit)
+- **Risk sizing distorted by 2s ticks** - ATR over 2-second pseudo-candles is tiny,
+  so `risk_budget / sl_distance` always exceeds the cap; the heat/collateral cap
+  is what actually sizes orders (~$24k notional)
+- **Hermes (Pyth) returned 401** during testing; venue mark is Pyth but no public
+  price endpoint exists - Hyperliquid allMids is the reference feed (same source
+  GoDark's UI uses for its reference book)
 
 ### Potential Issues to Watch
-- **Price data quality**: REST API `ccy/oi` may be stale
-- **Regime detection**: May not trigger if thresholds too tight
 - **Warmup time**: 40s minimum before first trade
-- **Testnet liquidity**: May have wide spreads
-- **Rate limits**: REST polling every 2s + WS
+- **Testnet liquidity**: May have wide spreads (grid post-only orders can still
+  cross in fast markets - current mid is 2s stale)
+- **Rate limits**: REST polling every 2s + Hyperliquid polling every 2s + WS
 
 ---
 
