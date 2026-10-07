@@ -34,7 +34,6 @@ jobs:
           GODARK_API_KEY_ID: ${{ secrets.GODARK_API_KEY_ID }}
           GODARK_API_SECRET: ${{ secrets.GODARK_API_SECRET }}
           GODARK_PASSPHRASE: ${{ secrets.GODARK_PASSPHRASE }}
-          DRY_RUN: "false"
         run: |
           set -e
           timeout 340m .venv/bin/python examples/quantitative_trading_agent.py
