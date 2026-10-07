@@ -13,6 +13,7 @@ import sys
 import signal
 import time
 import json
+from collections import deque
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP
 from typing import Dict, List, Optional, Tuple, Set, Deque
 from datetime import datetime
@@ -87,6 +88,56 @@ class TelegramNotifier:
             f"<b>Regime:</b> {regime}\n"
             f"<b>Module:</b> {old_name} → {new_name}"
         )
+
+# --- Trade Logger ---
+class TradeLogger:
+    def __init__(self, log_file: str = "trades.log"):
+        self.log_file = log_file
+    
+    def _write(self, record: dict):
+        record["timestamp"] = datetime.utcnow().isoformat() + "Z"
+        with open(self.log_file, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    
+    def log_trade(self, symbol: str, side: str, price: float, qty: float,
+                  module: str, order_id: str = None, sl: float = None, tp: float = None,
+                  regime: str = None):
+        record = {
+            "type": "trade",
+            "symbol": symbol,
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "module": module,
+            "order_id": order_id,
+            "sl": sl,
+            "tp": tp,
+            "regime": regime,
+        }
+        self._write(record)
+    
+    def log_grid(self, symbol: str, bid_price: float, ask_price: float,
+                 qty: float, order_ids: list, module: str = "B"):
+        record = {
+            "type": "grid",
+            "symbol": symbol,
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+            "qty_per_leg": qty,
+            "order_ids": order_ids,
+            "module": module,
+        }
+        self._write(record)
+    
+    def log_regime_switch(self, symbol: str, old_module: str, new_module: str, regime: str):
+        record = {
+            "type": "regime_switch",
+            "symbol": symbol,
+            "old_module": old_module,
+            "new_module": new_module,
+            "regime": regime,
+        }
+        self._write(record)
 
 # Ensure local vendored godark package is importable
 try:
@@ -306,6 +357,9 @@ class QuantitativeTradingAgent:
         # Telegram notifier
         self.telegram = telegram_notifier
 
+        # Trade logger
+        self.trade_logger = TradeLogger("trades.log")
+
     # -------------------------------------------------------------------------
     # Formatting Helpers
     # -------------------------------------------------------------------------
@@ -404,6 +458,14 @@ class QuantitativeTradingAgent:
                     sl=float(opts.stop_loss_price), tp=float(opts.take_profit_price)
                 )
                 await self.telegram.send(msg)
+            # Log trade
+            regime = self._detect_regime(symbol) if hasattr(self, '_detect_regime') else None
+            self.trade_logger.log_trade(
+                symbol=symbol, side=side, price=price, qty=qty,
+                module=module, order_id=order_id,
+                sl=float(opts.stop_loss_price), tp=float(opts.take_profit_price),
+                regime=regime
+            )
         except OrderError as e:
             logger.error(f"[{symbol}] Order Error (Code: {getattr(e, 'error_code', 'N/A')}): {e}")
 
@@ -458,10 +520,27 @@ class QuantitativeTradingAgent:
                     )
                     if hasattr(a_res, "order_id"):
                         new_order_ids.append(a_res.order_id)
-                except OrderError as e:
-                    logger.error(f"[{symbol}] Grid Placement Error ({getattr(e, 'error_code', 'N/A')}): {e}")
+except OrderError as e:
+            logger.error(f"[{symbol}] Grid Placement Error ({getattr(e, 'error_code', 'N/A')}): {e}")
 
         self.open_grid_orders[symbol] = new_order_ids
+        # Log grid placement
+        if new_order_ids:
+            self.trade_logger.log_grid(
+                symbol=symbol,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                qty=qty,
+                order_ids=new_order_ids,
+                module="B"
+            )
+            # Send Telegram notification
+            if self.telegram.enabled:
+                msg = self.telegram.format_grid(
+                    symbol=symbol, bid_price=bid_price, ask_price=ask_price,
+                    qty=qty, order_ids=new_order_ids
+                )
+                await self.telegram.send(msg)
 
     # -------------------------------------------------------------------------
     # Strategy Helpers
@@ -542,6 +621,13 @@ class QuantitativeTradingAgent:
             if old_module == "B":
                 await self.clear_grid_orders(symbol)
             # For directional modules (A, C, D), positions remain but we stop managing them
+            # Log regime switch
+            regime = self._detect_regime(symbol) if hasattr(self, '_detect_regime') else "UNKNOWN"
+            self.trade_logger.log_regime_switch(symbol, old_module, new_module, regime)
+            # Send Telegram notification
+            if self.telegram.enabled:
+                msg = self.telegram.format_regime_switch(symbol, old_module, new_module, regime)
+                await self.telegram.send(msg)
         self.active_modules[symbol] = new_module
 
     # -------------------------------------------------------------------------

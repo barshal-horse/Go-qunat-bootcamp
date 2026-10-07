@@ -38,3 +38,11 @@ jobs:
         run: |
           set -e
           timeout 340m .venv/bin/python examples/quantitative_trading_agent.py
+
+      - name: Upload trade logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trades-${{ github.run_id }}
+          path: trades.log
+          retention-days: 90
