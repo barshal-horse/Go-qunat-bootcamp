@@ -34,6 +34,8 @@ jobs:
           GODARK_API_KEY_ID: ${{ secrets.GODARK_API_KEY_ID }}
           GODARK_API_SECRET: ${{ secrets.GODARK_API_SECRET }}
           GODARK_PASSPHRASE: ${{ secrets.GODARK_PASSPHRASE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -e
           timeout 340m .venv/bin/python examples/quantitative_trading_agent.py

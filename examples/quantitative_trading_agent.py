@@ -15,70 +15,88 @@ import time
 import json
 from collections import deque
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP
-from typing import Dict, List, Optional, Tuple, Set, Deque
+from typing import Dict, List, Optional, Tuple, Set, Deque, Any
 from datetime import datetime
 
 import pandas as pd
 
-# --- Telegram Notifier ---
+# -----------------------------------------------------------------------------
+# Telegram Notifier
+# -----------------------------------------------------------------------------
 class TelegramNotifier:
     def __init__(self, bot_token: str, chat_id: str):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        self.base_url = f"https://api.telegram.org/bot{bot_token}"
-        self.enabled = bool(bot_token and chat_id)
-    
+        self.bot_token = bot_token.strip() if bot_token else ""
+        self.chat_id = chat_id.strip() if chat_id else ""
+        self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+        self.enabled = bool(self.bot_token and self.chat_id)
+
     async def send(self, text: str) -> bool:
         if not self.enabled:
             return False
         try:
             import aiohttp
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=8.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{self.base_url}/sendMessage",
-                    json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
+                    json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"},
                 ) as resp:
                     return resp.status == 200
         except Exception as e:
             logging.warning(f"Telegram notification failed: {e}")
             return False
-    
-    def format_trade(self, symbol: str, side: str, price: float, qty: float, 
-                     module: str, order_id: str = None, 
-                     sl: float = None, tp: float = None) -> str:
+
+    def format_trade(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        qty: float,
+        module: str,
+        order_id: Optional[str] = None,
+        sl: Optional[float] = None,
+        tp: Optional[float] = None,
+    ) -> str:
         emoji = "🟢" if side == "BUY" else "🔴"
         mod_name = {"A": "Trend", "B": "Grid", "C": "Funding", "D": "Breakout"}.get(module, module)
         lines = [
             f"{emoji} <b>Trade Executed</b> {emoji}",
             f"<b>Symbol:</b> {symbol}",
             f"<b>Side:</b> {side}",
-            f"<b>Price:</b> {price:,.8f}",
+            f"<b>Price:</b> {price:,.4f}",
             f"<b>Qty:</b> {qty}",
             f"<b>Module:</b> {mod_name} ({module})",
         ]
         if sl:
-            lines.append(f"<b>SL:</b> {sl:,.8f}")
+            lines.append(f"<b>SL:</b> {sl:,.4f}")
         if tp:
-            lines.append(f"<b>TP:</b> {tp:,.8f}")
+            lines.append(f"<b>TP:</b> {tp:,.4f}")
         if order_id:
             lines.append(f"<b>Order ID:</b> <code>{order_id}</code>")
         lines.append(f"<b>Time:</b> {datetime.utcnow().strftime('%H:%M:%S UTC')}")
         return "\n".join(lines)
-    
-    def format_grid(self, symbol: str, bid_price: float, ask_price: float, 
-                    qty: float, order_ids: list) -> str:
+
+    def format_grid(
+        self,
+        symbol: str,
+        bid_price: float,
+        ask_price: float,
+        qty: float,
+        order_ids: list,
+    ) -> str:
         lines = [
             f"📊 <b>Grid Placed</b> 📊",
             f"<b>Symbol:</b> {symbol}",
-            f"<b>Bid:</b> {bid_price:,.8f} | <b>Ask:</b> {ask_price:,.8f}",
+            f"<b>Bid:</b> {bid_price:,.4f} | <b>Ask:</b> {ask_price:,.4f}",
             f"<b>Qty per leg:</b> {qty}",
             f"<b>Orders:</b> {len(order_ids)} placed",
             f"<b>Time:</b> {datetime.utcnow().strftime('%H:%M:%S UTC')}",
         ]
         return "\n".join(lines)
-    
-    def format_regime_switch(self, symbol: str, old_module: str, new_module: str, 
-                              regime: str) -> str:
+
+    def format_regime_switch(
+        self, symbol: str, old_module: str, new_module: str, regime: str
+    ) -> str:
         mod_name = {"A": "Trend", "B": "Grid", "C": "Funding", "D": "Breakout"}
         old_name = mod_name.get(old_module, old_module)
         new_name = mod_name.get(new_module, new_module)
@@ -89,20 +107,42 @@ class TelegramNotifier:
             f"<b>Module:</b> {old_name} → {new_name}"
         )
 
-# --- Trade Logger ---
+
+# -----------------------------------------------------------------------------
+# Trade Logger (JSONL)
+# -----------------------------------------------------------------------------
 class TradeLogger:
     def __init__(self, log_file: str = "trades.log"):
         self.log_file = log_file
-    
+        # Ensure file exists immediately so artifacts never fail to upload
+        if not os.path.exists(self.log_file):
+            try:
+                with open(self.log_file, "w", encoding="utf-8") as f:
+                    f.write(json.dumps({"type": "init", "timestamp": datetime.utcnow().isoformat() + "Z"}) + "\n")
+            except Exception as e:
+                logging.warning(f"Failed initializing {self.log_file}: {e}")
+
     def _write(self, record: dict):
         record["timestamp"] = datetime.utcnow().isoformat() + "Z"
-        with open(self.log_file, "a") as f:
-            f.write(json.dumps(record) + "\n")
-    
-    def log_trade(self, symbol: str, side: str, price: float, qty: float,
-                  module: str, order_id: str = None, sl: float = None, tp: float = None,
-                  regime: str = None):
-        record = {
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            logging.warning(f"Failed to append to trade log {self.log_file}: {e}")
+
+    def log_trade(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        qty: float,
+        module: str,
+        order_id: Optional[str] = None,
+        sl: Optional[float] = None,
+        tp: Optional[float] = None,
+        regime: Optional[str] = None,
+    ):
+        self._write({
             "type": "trade",
             "symbol": symbol,
             "side": side,
@@ -113,12 +153,18 @@ class TradeLogger:
             "sl": sl,
             "tp": tp,
             "regime": regime,
-        }
-        self._write(record)
-    
-    def log_grid(self, symbol: str, bid_price: float, ask_price: float,
-                 qty: float, order_ids: list, module: str = "B"):
-        record = {
+        })
+
+    def log_grid(
+        self,
+        symbol: str,
+        bid_price: float,
+        ask_price: float,
+        qty: float,
+        order_ids: list,
+        module: str = "B",
+    ):
+        self._write({
             "type": "grid",
             "symbol": symbol,
             "bid_price": bid_price,
@@ -126,22 +172,46 @@ class TradeLogger:
             "qty_per_leg": qty,
             "order_ids": order_ids,
             "module": module,
-        }
-        self._write(record)
-    
+        })
+
     def log_regime_switch(self, symbol: str, old_module: str, new_module: str, regime: str):
-        record = {
+        self._write({
             "type": "regime_switch",
             "symbol": symbol,
             "old_module": old_module,
             "new_module": new_module,
             "regime": regime,
-        }
-        self._write(record)
+        })
 
-# Ensure local vendored godark package is importable
+
+# -----------------------------------------------------------------------------
+# Configuration & Setup
+# -----------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from godark import GodarkClient, MarketDataClient, GodarkRestClient, PlaceOrderOptions
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("GoDarkQuantAgent")
+
+try:
+    from godark import (
+        GodarkClient,
+        MarketDataClient,
+        GodarkRestClient,
+        PlaceOrderOptions,
+        TransportConfig,
+        Side,
+        OrderType,
+        TimeInForce,
+    )
     from godark._symbols import load_offline_decimals_map
     from godark.errors import (
         GodarkError,
@@ -152,47 +222,28 @@ try:
         TimeoutError as GDXTimeoutError,
     )
 except ImportError:
-    print(
-        "ERROR: Could not import 'godark'. Ensure script is executed inside the "
-        "repo environment with vendored SDK path.",
-        file=sys.stderr,
+    logger.critical(
+        "Could not import 'godark'. Ensure script is executed in an environment with "
+        "the godark package installed."
     )
     sys.exit(1)
 
-# Import local helpers
-try:
-    from trade_safety import post_only_price
-except ImportError:
-    post_only_price = None
-
-# -----------------------------------------------------------------------------
-# Configuration & Setup
-# -----------------------------------------------------------------------------
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dotenv import load_dotenv  # repo-local stdlib .env loader (examples/dotenv.py)
-load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-load_dotenv()
-os.environ["GODARK_ENABLE_TRADES"] = "0"
-from godark import TransportConfig
-
-# Telegram notifier (uses env vars)
+# Telegram Notifier Instance
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 telegram_notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+if telegram_notifier.enabled:
+    logger.info("Telegram notifications ENABLED.")
+else:
+    logger.info("Telegram notifications DISABLED (credentials missing in environment).")
 
-# Configure WebSocket transport for better resilience to server ping issues
+# Configure WebSocket transport
 transport_config = TransportConfig(
-    heartbeat_interval=20.0,       # ping every 20s (server idle timeout is 30s)
-    stale_timeout=900.0,           # wait 15min before stale (was 2min)
-    missed_heartbeat_limit=10,     # allow 10 missed pings (was 2)
-    command_timeout=60.0,          # increase command timeout for slow server responses
+    heartbeat_interval=20.0,
+    stale_timeout=900.0,
+    missed_heartbeat_limit=10,
+    command_timeout=60.0,
 )
-logger = logging.getLogger("GoDarkQuantAgent")
 
 API_KEY_ID = os.getenv("GODARK_API_KEY_ID")
 API_SECRET = os.getenv("GODARK_API_SECRET")
@@ -201,60 +252,54 @@ WS_URL = os.getenv("GODARK_WS_URL", "wss://api.godark-dex.com")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 
 if not all([API_KEY_ID, API_SECRET, PASSPHRASE]):
-    logger.critical("Missing required env variables: GODARK_API_KEY_ID, GODARK_API_SECRET, or GODARK_PASSPHRASE")
+    logger.critical("Missing required environment variables: GODARK_API_KEY_ID, GODARK_API_SECRET, or GODARK_PASSPHRASE")
     sys.exit(1)
 
-# Derive REST HTTPS URL from WSS URL
 REST_BASE_URL = WS_URL.replace("wss://", "https://").replace("ws://", "http://")
-
 SYMBOLS = ["BTC-USDC-PERP", "ETH-USDC-PERP", "SOL-USDC-PERP"]
 DEFAULT_LEVERAGE = 3
-RISK_FACTOR = 0.015  # 1.5% portfolio risk per trade
+RISK_FACTOR = 0.015
 LOOP_INTERVAL_SECONDS = 15
-FEED_INTERVAL_SECONDS = 2  # price sampling cadence for the REST implied-mark feeder
-MIN_NOTIONAL_USD = 100.0   # venue rejects orders below min notional (code 2013); use a safe floor
+FEED_INTERVAL_SECONDS = 2
+MIN_NOTIONAL_USD = 100.0
 DECIMALS_MAP = load_offline_decimals_map()
-SYMBOL_IDS = {"BTC-USDC-PERP": 1, "ETH-USDC-PERP": 2, "SOL-USDC-PERP": 5}  # offline fallback ids
+SYMBOL_IDS = {"BTC-USDC-PERP": 1, "ETH-USDC-PERP": 2, "SOL-USDC-PERP": 5}
 
-# -----------------------------------------------------------------------------
 # Strategy Parameters
-# -----------------------------------------------------------------------------
-# Module C: Funding Momentum
-FUNDING_LONG_THRESHOLD = -0.0005   # -0.05% 8hr (shorts pay longs -> go LONG)
-FUNDING_SHORT_THRESHOLD = 0.0005   # +0.05% 8hr (longs pay shorts -> go SHORT)
-FUNDING_EXIT_THRESHOLD = 0.0001    # 0.01% 8hr (exit when funding normalizes)
+FUNDING_LONG_THRESHOLD = -0.0005
+FUNDING_SHORT_THRESHOLD = 0.0005
+FUNDING_EXIT_THRESHOLD = 0.0001
 FUNDING_MAX_HOLD_HOURS = 24
 
-# Module D: OI-Weighted Breakout (Keltner)
 OI_LOOKBACK_HOURS = 4
 OI_SURGE_THRESHOLD = 0.20
-OI_DROP_THRESHOLD = -0.15
 
 KELTNER_PERIOD = 20
 KELTNER_ATR_MULT = 2.0
 
-# Regime Configuration
 REGIME_CONFIG = {
     "TREND":       {"module": "A", "weight": 0.45, "leverage": 3, "max_pos": 2},
     "MEAN_REV":    {"module": "B", "weight": 0.25, "leverage": 2, "max_pos": 3},
     "FUNDING":     {"module": "C", "weight": 0.15, "leverage": 2, "max_pos": 2},
     "BREAKOUT":    {"module": "D", "weight": 0.15, "leverage": 3, "max_pos": 1},
 }
+MAX_PORTFOLIO_HEAT = 0.80
 
-# Portfolio heat limit
-MAX_PORTFOLIO_HEAT = 0.80  # 80% max collateral utilization
+
+def to_sdk_side(side_str: str) -> Side:
+    return Side.BUY if str(side_str).upper() == "BUY" else Side.SELL
 
 
 # -----------------------------------------------------------------------------
 # Technical Analysis Engine
 # -----------------------------------------------------------------------------
 class TechnicalIndicators:
-    """Computes technical indicator series for Module A (Trend) and Module B (Grid/Mean-Reversion)."""
-
     @staticmethod
     def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-        if len(df) < 20:
+        if len(df) < 5:
             return df
+
+        df = df.copy()
 
         # EMAs
         df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
@@ -262,8 +307,8 @@ class TechnicalIndicators:
 
         # RSI 14
         delta = df["close"].diff()
-        gain = delta.clip(lower=0).rolling(window=14).mean()
-        loss = (-delta.clip(upper=0)).rolling(window=14).mean()
+        gain = delta.clip(lower=0).rolling(window=14, min_periods=1).mean()
+        loss = (-delta.clip(upper=0)).rolling(window=14, min_periods=1).mean()
         rs = gain / (loss.replace(0, 1e-9))
         df["rsi"] = 100.0 - (100.0 / (1.0 + rs))
 
@@ -272,7 +317,7 @@ class TechnicalIndicators:
         high_close = (df["high"] - df["close"].shift()).abs()
         low_close = (df["low"] - df["close"].shift()).abs()
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df["atr"] = tr.rolling(window=14).mean()
+        df["atr"] = tr.rolling(window=14, min_periods=1).mean().fillna(0.0)
 
         # ADX 14
         up = df["high"].diff()
@@ -280,15 +325,15 @@ class TechnicalIndicators:
         plus_dm = up.where((up > down) & (up > 0), 0.0)
         minus_dm = down.where((down > up) & (down > 0), 0.0)
 
-        tr_smooth = tr.rolling(14).sum()
-        plus_di = 100 * (plus_dm.rolling(14).sum() / tr_smooth.replace(0, 1e-9))
-        minus_di = 100 * (minus_dm.rolling(14).sum() / tr_smooth.replace(0, 1e-9))
+        tr_smooth = tr.rolling(14, min_periods=1).sum().replace(0, 1e-9)
+        plus_di = 100 * (plus_dm.rolling(14, min_periods=1).sum() / tr_smooth)
+        minus_di = 100 * (minus_dm.rolling(14, min_periods=1).sum() / tr_smooth)
         dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9))
-        df["adx"] = dx.rolling(14).mean()
+        df["adx"] = dx.rolling(14, min_periods=1).mean().fillna(0.0)
 
         # Bollinger Bands (20, 2)
-        df["bb_mid"] = df["close"].rolling(20).mean()
-        std = df["close"].rolling(20).std()
+        df["bb_mid"] = df["close"].rolling(20, min_periods=1).mean()
+        std = df["close"].rolling(20, min_periods=1).std().fillna(0.0)
         df["bb_upper"] = df["bb_mid"] + (2.0 * std)
         df["bb_lower"] = df["bb_mid"] - (2.0 * std)
 
@@ -301,17 +346,22 @@ class TechnicalIndicators:
 
 
 # -----------------------------------------------------------------------------
-# Market Data Feed Manager
+# Market Data Manager
 # -----------------------------------------------------------------------------
 class MarketDataManager:
-    """Maintains real-time tick/orderbook data stream via MarketDataClient."""
-
     def __init__(self, symbols: List[str]):
         self.symbols = symbols
         self.price_history: Dict[str, List[Dict[str, float]]] = {s: [] for s in symbols}
         self.current_mids: Dict[str, float] = {}
 
-    def push_tick(self, symbol: str, price: float, high: Optional[float] = None, low: Optional[float] = None, volume: Optional[float] = None):
+    def push_tick(
+        self,
+        symbol: str,
+        price: float,
+        high: Optional[float] = None,
+        low: Optional[float] = None,
+        volume: Optional[float] = None,
+    ):
         if not price or price <= 0:
             return
         self.current_mids[symbol] = price
@@ -336,28 +386,23 @@ class MarketDataManager:
 # Core Quantitative Trading Agent
 # -----------------------------------------------------------------------------
 class QuantitativeTradingAgent:
-
     def __init__(self, client: GodarkClient, rest_client: GodarkRestClient):
         self.client = client
         self.rest_client = rest_client
         self.md_manager = MarketDataManager(SYMBOLS)
         self.md_client: Optional[MarketDataClient] = None
 
-        self.positions: Dict[str, Dict] = {}  # symbol -> position info
-        self.open_grid_orders: Dict[str, List[int]] = {s: [] for s in SYMBOLS}
+        self.positions: Dict[str, Dict] = {}
+        self.open_grid_orders: Dict[str, List[str]] = {s: [] for s in SYMBOLS}
         self.system_health_accepting: bool = True
         self.running: bool = True
 
-        # Multi-strategy state
-        self.active_modules: Dict[str, str] = {}  # symbol -> active module
+        self.active_modules: Dict[str, str] = {}
         self.funding_rates: Dict[str, float] = {}
-        self.oi_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=200) for s in SYMBOLS}  # (timestamp, oi)
-        self.volume_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=200) for s in SYMBOLS}  # (timestamp, volume)
+        self.oi_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=300) for s in SYMBOLS}
+        self.volume_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=300) for s in SYMBOLS}
 
-        # Telegram notifier
         self.telegram = telegram_notifier
-
-        # Trade logger
         self.trade_logger = TradeLogger("trades.log")
 
     # -------------------------------------------------------------------------
@@ -380,24 +425,62 @@ class QuantitativeTradingAgent:
         return str(d.quantize(Decimal(pattern), rounding=ROUND_DOWN))
 
     # -------------------------------------------------------------------------
-    # Account & Position Risk Management
+    # Account & Risk Management
     # -------------------------------------------------------------------------
     async def get_collateral_balance(self) -> float:
         try:
             acct = await self.rest_client.get_account()
-            if acct and hasattr(acct, "summary"):
-                return float(acct.summary.total_collateral or acct.summary.free_collateral or 10000.0)
+            if acct:
+                summary = getattr(acct, "summary", None) or (acct.get("summary") if isinstance(acct, dict) else None)
+                if summary:
+                    total = getattr(summary, "total_collateral", None) or (summary.get("total_collateral") if isinstance(summary, dict) else None)
+                    free = getattr(summary, "free_collateral", None) or (summary.get("free_collateral") if isinstance(summary, dict) else None)
+                    val = float(total or free or 0)
+                    if val > 0:
+                        return val
         except Exception as e:
             logger.warning(f"Could not fetch account collateral via REST: {e}")
-        return 10000.0  # Safe fallback estimate
+        return 10000.0
+
+    async def sync_positions(self):
+        try:
+            positions_data = await self.rest_client.get_positions()
+            if positions_data:
+                items = positions_data if isinstance(positions_data, list) else getattr(positions_data, "positions", [])
+                new_positions = {}
+                for pos in items:
+                    sym = pos.get("symbol") if isinstance(pos, dict) else getattr(pos, "symbol", None)
+                    size = float(pos.get("size", 0) if isinstance(pos, dict) else getattr(pos, "size", 0) or 0)
+                    notional = float(pos.get("notional", 0) if isinstance(pos, dict) else getattr(pos, "notional", 0) or 0)
+                    entry_price = float(pos.get("entry_price", 0) if isinstance(pos, dict) else getattr(pos, "entry_price", 0) or 0)
+                    if sym and abs(size) > 0:
+                        new_positions[sym] = {
+                            "symbol": sym,
+                            "size": size,
+                            "notional": notional if notional != 0 else size * entry_price,
+                            "entry_price": entry_price,
+                        }
+                self.positions = new_positions
+        except Exception as e:
+            logger.debug(f"Could not sync positions via REST: {e}")
+
+    def _check_portfolio_heat(self) -> bool:
+        try:
+            total_notional = sum(abs(pos.get("notional", 0.0)) for pos in self.positions.values())
+            max_notional = 10000.0 * 3.0
+            heat = total_notional / max_notional if max_notional > 0 else 0
+            return heat < MAX_PORTFOLIO_HEAT
+        except Exception:
+            return True
+
+    def _get_active_module_count(self, module: str) -> int:
+        return sum(1 for m in self.active_modules.values() if m == module)
 
     async def calculate_risk_position_size(self, symbol: str, entry_price: float, atr: float) -> float:
         collateral = await self.get_collateral_balance()
         risk_budget = collateral * RISK_FACTOR
-        sl_distance = 1.5 * atr
-
-        if sl_distance <= 0:
-            return 0.0
+        effective_atr = max(atr if not pd.isna(atr) else 0.0, entry_price * 0.002)
+        sl_distance = 1.5 * effective_atr
 
         raw_qty = risk_budget / sl_distance
         max_notional = collateral * DEFAULT_LEVERAGE
@@ -407,67 +490,91 @@ class QuantitativeTradingAgent:
         final_qty = min(max(raw_qty, min_notional_qty), max_qty)
         dec = DECIMALS_MAP.get(symbol)
         min_qty = 10 ** (-(dec.quantity_decimals if dec else 3))
-
         return max(final_qty, min_qty)
 
     # -------------------------------------------------------------------------
-    # Execution Engine
+    # Order Routing & Execution
     # -------------------------------------------------------------------------
     async def place_directional_order(
-        self, symbol: str, side: str, price: float, qty: float, atr: float,
-        module: str = "A"
+        self, symbol: str, side: str, price: float, qty: float, atr: float, module: str = "A"
     ):
         p_str = self.format_price(symbol, price)
         q_str = self.format_qty(symbol, qty)
 
-        sl = price - (1.5 * atr) if side == "BUY" else price + (1.5 * atr)
-        tp = price + (3.0 * atr) if side == "BUY" else price - (3.0 * atr)
+        effective_atr = max(atr if not pd.isna(atr) else 0.0, price * 0.002)
+        sl = price - (1.5 * effective_atr) if side == "BUY" else price + (1.5 * effective_atr)
+        tp = price + (3.0 * effective_atr) if side == "BUY" else price - (3.0 * effective_atr)
+
+        sl_str = self.format_price(symbol, sl)
+        tp_str = self.format_price(symbol, tp)
 
         opts = PlaceOrderOptions(
-            stop_loss_price=self.format_price(symbol, sl),
-            take_profit_price=self.format_price(symbol, tp),
+            stop_loss_price=sl_str,
+            take_profit_price=tp_str,
             stp_mode="CANCEL_AGGRESSOR",
         )
 
         logger.info(
-            f"[{symbol}] MODULE A Signal -> Side: {side} | Price: {p_str} | Qty: {q_str} | "
-            f"SL: {opts.stop_loss_price} | TP: {opts.take_profit_price}"
+            f"[{symbol}] MODULE {module} Signal -> Side: {side} | Price: {p_str} | Qty: {q_str} | "
+            f"SL: {sl_str} | TP: {tp_str}"
         )
 
         if DRY_RUN:
-            logger.info(f"[{symbol}] DRY_RUN enabled. Order execution skipped.")
-            return
-
-        try:
-            res = await self.client.place_order(
-                symbol=symbol,
-                side=side,
-                order_type="LIMIT",
-                quantity=q_str,
-                price=p_str,
-                time_in_force="GTC",
-                options=opts,
+            logger.info(f"[{symbol}] DRY_RUN enabled. Order execution simulated.")
+            order_id = "DRY_RUN_" + str(int(time.time()))
+            regime = self._detect_regime(symbol)
+            self.trade_logger.log_trade(
+                symbol=symbol, side=side, price=price, qty=qty,
+                module=module, order_id=order_id,
+                sl=float(sl_str), tp=float(tp_str), regime=regime
             )
-            logger.info(f"[{symbol}] Directional order placed successfully: {res}")
-            # Send Telegram notification
-            order_id = getattr(res, 'order_id', None)
             if self.telegram.enabled:
                 msg = self.telegram.format_trade(
                     symbol=symbol, side=side, price=price, qty=qty,
                     module=module, order_id=order_id,
-                    sl=float(opts.stop_loss_price), tp=float(opts.take_profit_price)
+                    sl=float(sl_str), tp=float(tp_str)
                 )
                 await self.telegram.send(msg)
-            # Log trade
-            regime = self._detect_regime(symbol) if hasattr(self, '_detect_regime') else None
+            return
+
+        try:
+            ack = await self.client.place_order(
+                symbol=symbol,
+                side=to_sdk_side(side),
+                order_type=OrderType.LIMIT,
+                quantity=q_str,
+                price=p_str,
+                time_in_force=TimeInForce.GTC,
+                options=opts,
+            )
+
+            success = getattr(ack, "success", True)
+            order_id = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
+            error = getattr(ack, "error", None) or getattr(ack, "error_code", None)
+
+            if not success:
+                logger.error(f"[{symbol}] Order rejected by venue: error={error}")
+                return
+
+            logger.info(f"[{symbol}] Order successfully accepted: order_id={order_id}")
+            regime = self._detect_regime(symbol)
+
             self.trade_logger.log_trade(
                 symbol=symbol, side=side, price=price, qty=qty,
-                module=module, order_id=order_id,
-                sl=float(opts.stop_loss_price), tp=float(opts.take_profit_price),
-                regime=regime
+                module=module, order_id=str(order_id) if order_id else None,
+                sl=float(sl_str), tp=float(tp_str), regime=regime
             )
+            if self.telegram.enabled:
+                msg = self.telegram.format_trade(
+                    symbol=symbol, side=side, price=price, qty=qty,
+                    module=module, order_id=str(order_id) if order_id else None,
+                    sl=float(sl_str), tp=float(tp_str)
+                )
+                await self.telegram.send(msg)
         except OrderError as e:
-            logger.error(f"[{symbol}] Order Error (Code: {getattr(e, 'error_code', 'N/A')}): {e}")
+            logger.error(f"[{symbol}] Order Error ({getattr(e, 'error_code', 'N/A')}): {e}")
+        except Exception as e:
+            logger.error(f"[{symbol}] Unexpected order placement failure: {e}", exc_info=True)
 
     async def clear_grid_orders(self, symbol: str):
         order_ids = self.open_grid_orders.get(symbol, [])
@@ -476,22 +583,32 @@ class QuantitativeTradingAgent:
 
         logger.info(f"[{symbol}] Clearing {len(order_ids)} stale Module B grid orders...")
         if not DRY_RUN:
-            try:
-                await self.client.batch_cancel(symbol, order_ids[:20])
-            except Exception as e:
-                logger.error(f"[{symbol}] Error clearing grid orders: {e}")
+            for oid in order_ids:
+                try:
+                    await self.client.cancel_order(str(oid), symbol)
+                except Exception as e:
+                    logger.debug(f"[{symbol}] Error cancelling order {oid}: {e}")
         self.open_grid_orders[symbol] = []
 
     async def execute_grid_module(self, symbol: str, mid_price: float):
+        await self._switch_module(symbol, "B")
+        config = REGIME_CONFIG["MEAN_REV"]
+        if self._get_active_module_count("B") > config["max_pos"]:
+            return
+
+        try:
+            await self.client.update_leverage(symbol, config["leverage"])
+        except Exception as e:
+            logger.debug(f"[{symbol}] Leverage update notice: {e}")
+
         await self.clear_grid_orders(symbol)
+
         dec = DECIMALS_MAP.get(symbol)
         min_qty = 10 ** (-(dec.quantity_decimals if dec else 3))
-        # Ensure each grid leg clears the venue minimum notional (BELOW_MIN_NOTIONAL = 2013)
         qty = max(min_qty, MIN_NOTIONAL_USD / mid_price)
         q_str = self.format_qty(symbol, qty)
 
         new_order_ids = []
-        # Create 2 bid and 2 ask levels spaced at 0.2% and 0.4%
         offsets = [0.002, 0.004]
 
         for offset in offsets:
@@ -505,224 +622,61 @@ class QuantitativeTradingAgent:
 
             if not DRY_RUN:
                 try:
-                    b_res = await self.client.place_order(
-                        symbol=symbol, side="BUY", order_type="LIMIT",
-                        quantity=q_str, price=bid_str, time_in_force="GTC", options=opts,
-                        confirmation="ack"
+                    b_ack = await self.client.place_order(
+                        symbol=symbol,
+                        side=Side.BUY,
+                        order_type=OrderType.LIMIT,
+                        quantity=q_str,
+                        price=bid_str,
+                        time_in_force=TimeInForce.GTC,
+                        options=opts,
                     )
-                    if hasattr(b_res, "order_id"):
-                        new_order_ids.append(b_res.order_id)
+                    b_id = getattr(b_ack, "order_id", None)
+                    if getattr(b_ack, "success", True) and b_id:
+                        new_order_ids.append(str(b_id))
+                except OrderError as e:
+                    logger.error(f"[{symbol}] Grid Buy Error ({getattr(e, 'error_code', 'N/A')}): {e}")
 
-                    a_res = await self.client.place_order(
-                        symbol=symbol, side="SELL", order_type="LIMIT",
-                        quantity=q_str, price=ask_str, time_in_force="GTC", options=opts,
-                        confirmation="ack"
+                try:
+                    a_ack = await self.client.place_order(
+                        symbol=symbol,
+                        side=Side.SELL,
+                        order_type=OrderType.LIMIT,
+                        quantity=q_str,
+                        price=ask_str,
+                        time_in_force=TimeInForce.GTC,
+                        options=opts,
                     )
-                    if hasattr(a_res, "order_id"):
-                        new_order_ids.append(a_res.order_id)
-except OrderError as e:
-            logger.error(f"[{symbol}] Grid Placement Error ({getattr(e, 'error_code', 'N/A')}): {e}")
+                    a_id = getattr(a_ack, "order_id", None)
+                    if getattr(a_ack, "success", True) and a_id:
+                        new_order_ids.append(str(a_id))
+                except OrderError as e:
+                    logger.error(f"[{symbol}] Grid Sell Error ({getattr(e, 'error_code', 'N/A')}): {e}")
+            else:
+                new_order_ids.extend(["SIM_BID_" + bid_str, "SIM_ASK_" + ask_str])
 
         self.open_grid_orders[symbol] = new_order_ids
-        # Log grid placement
         if new_order_ids:
             self.trade_logger.log_grid(
                 symbol=symbol,
-                bid_price=bid_price,
-                ask_price=ask_price,
+                bid_price=mid_price * 0.998,
+                ask_price=mid_price * 1.002,
                 qty=qty,
                 order_ids=new_order_ids,
-                module="B"
+                module="B",
             )
-            # Send Telegram notification
             if self.telegram.enabled:
                 msg = self.telegram.format_grid(
-                    symbol=symbol, bid_price=bid_price, ask_price=ask_price,
-                    qty=qty, order_ids=new_order_ids
+                    symbol=symbol,
+                    bid_price=mid_price * 0.998,
+                    ask_price=mid_price * 1.002,
+                    qty=qty,
+                    order_ids=new_order_ids,
                 )
                 await self.telegram.send(msg)
 
     # -------------------------------------------------------------------------
-    # Strategy Helpers
-    # -------------------------------------------------------------------------
-    def _get_oi_change(self, symbol: str, hours: int = OI_LOOKBACK_HOURS) -> float:
-        """Calculate OI change over lookback period."""
-        history = self.oi_history.get(symbol)
-        if not history or len(history) < 2:
-            return 0.0
-        cutoff = time.time() - hours * 3600
-        recent = [oi for ts, oi in history if ts >= cutoff]
-        if len(recent) < 2:
-            return 0.0
-        return (recent[-1] - recent[0]) / recent[0] if recent[0] > 0 else 0.0
-
-    def _get_avg_volume(self, symbol: str, hours: int = 1) -> float:
-        """Get average volume over lookback period."""
-        history = self.volume_history.get(symbol)
-        if not history or len(history) < 2:
-            return 0.0
-        cutoff = time.time() - hours * 3600
-        recent = [vol for ts, vol in history if ts >= cutoff]
-        if not recent:
-            return 0.0
-        return sum(recent) / len(recent)
-
-    def _detect_regime(self, symbol: str) -> str:
-        """Detect market regime for a symbol."""
-        df = self.md_manager.get_dataframe(symbol)
-        if len(df) < 20:
-            return "WARMUP"
-
-        df = TechnicalIndicators.calculate_indicators(df)
-        latest = df.iloc[-1]
-
-        adx = latest.get("adx", 0)
-        bb_mid = latest.get("bb_mid", 1)
-        bb_upper = latest.get("bb_upper", 0)
-        bb_lower = latest.get("bb_lower", 0)
-        bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid > 0 else 0
-        funding = abs(self.funding_rates.get(symbol, 0))
-        oi_change = self._get_oi_change(symbol)
-
-        if funding > FUNDING_EXIT_THRESHOLD:
-            return "FUNDING"
-        elif adx > 25:
-            return "TREND"
-        elif bb_width < 0.015:
-            return "BREAKOUT"
-        else:
-            return "MEAN_REV"
-
-    def _check_portfolio_heat(self) -> bool:
-        """Check if portfolio heat is within limits."""
-        # This is a synchronous check; we use a cached collateral estimate
-        # In production, you'd want to fetch fresh collateral
-        try:
-            # Quick estimate using position notional vs max leverage
-            total_notional = sum(
-                abs(pos.get("notional", 0)) for pos in self.positions.values()
-            )
-            # Assume 10k collateral * 3x leverage = 30k max notional
-            max_notional = 10000.0 * 3.0
-            heat = total_notional / max_notional if max_notional > 0 else 0
-            return heat < MAX_PORTFOLIO_HEAT
-        except Exception:
-            return True
-
-    def _get_active_module_count(self, module: str) -> int:
-        """Count active positions for a module."""
-        return sum(1 for m in self.active_modules.values() if m == module)
-
-    async def _switch_module(self, symbol: str, new_module: str):
-        """Switch active module for a symbol, clearing old orders."""
-        old_module = self.active_modules.get(symbol)
-        if old_module and old_module != new_module:
-            logger.info(f"[{symbol}] Switching from Module {old_module} to Module {new_module}")
-            if old_module == "B":
-                await self.clear_grid_orders(symbol)
-            # For directional modules (A, C, D), positions remain but we stop managing them
-            # Log regime switch
-            regime = self._detect_regime(symbol) if hasattr(self, '_detect_regime') else "UNKNOWN"
-            self.trade_logger.log_regime_switch(symbol, old_module, new_module, regime)
-            # Send Telegram notification
-            if self.telegram.enabled:
-                msg = self.telegram.format_regime_switch(symbol, old_module, new_module, regime)
-                await self.telegram.send(msg)
-        self.active_modules[symbol] = new_module
-
-    # -------------------------------------------------------------------------
-    # Module C: Funding Momentum
-    # -------------------------------------------------------------------------
-    async def execute_funding_module(self, symbol: str, mid_price: float):
-        funding = self.funding_rates.get(symbol, 0)
-        df = self.md_manager.get_dataframe(symbol)
-        if len(df) < 14:
-            return
-
-        df = TechnicalIndicators.calculate_indicators(df)
-        latest = df.iloc[-1]
-        rsi = latest["rsi"]
-        atr = latest["atr"]
-
-        # LONG: negative funding (shorts pay longs) + RSI not overbought
-        if funding <= FUNDING_LONG_THRESHOLD and rsi < 70:
-            await self._switch_module(symbol, "C")
-            config = REGIME_CONFIG["FUNDING"]
-            if self._get_active_module_count("C") >= config["max_pos"]:
-                return
-            if not self._check_portfolio_heat():
-                return
-
-            await self.client.update_leverage(symbol, config["leverage"])
-            qty = await self.calculate_risk_position_size(symbol, mid_price, atr)
-            await self.place_directional_order(symbol, "BUY", mid_price, qty, atr, module="C")
-            logger.info(f"[{symbol}] Module C (Funding) LONG: funding={funding:.6f}, RSI={rsi:.1f}")
-
-        # SHORT: positive funding (longs pay shorts) + RSI not oversold
-        elif funding >= FUNDING_SHORT_THRESHOLD and rsi > 30:
-            await self._switch_module(symbol, "C")
-            config = REGIME_CONFIG["FUNDING"]
-            if self._get_active_module_count("C") >= config["max_pos"]:
-                return
-            if not self._check_portfolio_heat():
-                return
-
-            await self.client.update_leverage(symbol, config["leverage"])
-            qty = await self.calculate_risk_position_size(symbol, mid_price, atr)
-            await self.place_directional_order(symbol, "SELL", mid_price, qty, atr, module="C")
-            logger.info(f"[{symbol}] Module C (Funding) SHORT: funding={funding:.6f}, RSI={rsi:.1f}")
-
-    # -------------------------------------------------------------------------
-    # Module D: OI-Weighted Breakout (Keltner)
-    # -------------------------------------------------------------------------
-    async def execute_breakout_module(self, symbol: str, mid_price: float):
-        df = self.md_manager.get_dataframe(symbol)
-        if len(df) < KELTNER_PERIOD:
-            return
-
-        df = TechnicalIndicators.calculate_indicators(df)
-        latest = df.iloc[-1]
-
-        oi_change = self._get_oi_change(symbol)
-        avg_volume = self._get_avg_volume(symbol)
-        current_volume = latest.get("volume", 0)
-
-        # LONG: breakout upper + OI surge + volume confirmation
-        if (latest["close"] > latest["keltner_upper"] and
-            oi_change > OI_SURGE_THRESHOLD and
-            current_volume > avg_volume * 1.5 if avg_volume > 0 else False):
-
-            await self._switch_module(symbol, "D")
-            config = REGIME_CONFIG["BREAKOUT"]
-            if self._get_active_module_count("D") >= config["max_pos"]:
-                return
-            if not self._check_portfolio_heat():
-                return
-
-            await self.client.update_leverage(symbol, config["leverage"])
-            qty = await self.calculate_risk_position_size(symbol, mid_price, latest["atr"])
-            await self.place_directional_order(symbol, "BUY", mid_price, qty, latest["atr"], module="D")
-            logger.info(f"[{symbol}] Module D (Breakout) LONG: OI_chg={oi_change:.2%}, vol_ratio={current_volume/avg_volume:.2f}")
-
-        # SHORT: breakout lower + OI surge + volume confirmation
-        elif (latest["close"] < latest["keltner_lower"] and
-              oi_change > OI_SURGE_THRESHOLD and
-              current_volume > avg_volume * 1.5 if avg_volume > 0 else False):
-
-            await self._switch_module(symbol, "D")
-            config = REGIME_CONFIG["BREAKOUT"]
-            if self._get_active_module_count("D") >= config["max_pos"]:
-                return
-            if not self._check_portfolio_heat():
-                return
-
-            await self.client.update_leverage(symbol, config["leverage"])
-            qty = await self.calculate_risk_position_size(symbol, mid_price, latest["atr"])
-            await self.place_directional_order(symbol, "SELL", mid_price, qty, latest["atr"], module="D")
-            logger.info(f"[{symbol}] Module D (Breakout) SHORT: OI_chg={oi_change:.2%}, vol_ratio={current_volume/avg_volume:.2f}")
-
-    # -------------------------------------------------------------------------
-    # Module A: Trend (extracted from evaluate_symbol)
+    # Strategy Modules
     # -------------------------------------------------------------------------
     async def execute_trend_module(self, symbol: str, mid_price: float):
         df = self.md_manager.get_dataframe(symbol)
@@ -733,158 +687,233 @@ except OrderError as e:
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
-        close = latest["close"]
-        ema_20, ema_50 = latest["ema_20"], latest["ema_50"]
-        prev_ema20, prev_ema50 = prev["ema_20"], prev["ema_50"]
-        rsi, atr, adx = latest["rsi"], latest["atr"], latest["adx"]
-        bb_upper, bb_lower = latest["bb_upper"], latest["bb_lower"]
+        close = float(latest["close"])
+        ema_20, ema_50 = float(latest["ema_20"]), float(latest["ema_50"])
+        prev_ema20, prev_ema50 = float(prev["ema_20"]), float(prev["ema_50"])
+        rsi = float(latest["rsi"]) if not pd.isna(latest["rsi"]) else 50.0
+        atr = float(latest["atr"]) if not pd.isna(latest["atr"]) else close * 0.002
 
         bullish_cross = (prev_ema20 <= prev_ema50) and (ema_20 > ema_50)
         bearish_cross = (prev_ema20 >= prev_ema50) and (ema_20 < ema_50)
+        bullish_trend = (ema_20 > ema_50) and (close >= ema_20)
+        bearish_trend = (ema_20 < ema_50) and (close <= ema_20)
 
-        if bullish_cross and (50.0 <= rsi <= 65.0):
+        config = REGIME_CONFIG["TREND"]
+
+        if (bullish_cross or bullish_trend) and (50.0 <= rsi <= 68.0):
+            if self._get_active_module_count("A") >= config["max_pos"] or not self._check_portfolio_heat():
+                return
             await self._switch_module(symbol, "A")
-            config = REGIME_CONFIG["TREND"]
-            if self._get_active_module_count("A") >= config["max_pos"]:
-                return
-            if not self._check_portfolio_heat():
-                return
-
-            await self.client.update_leverage(symbol, config["leverage"])
+            try:
+                await self.client.update_leverage(symbol, config["leverage"])
+            except Exception as e:
+                logger.debug(f"[{symbol}] Leverage update notice: {e}")
             qty = await self.calculate_risk_position_size(symbol, close, atr)
-            await self.place_directional_order(symbol, "BUY", close, qty, atr)
+            await self.place_directional_order(symbol, "BUY", close, qty, atr, module="A")
 
-        elif bearish_cross and (35.0 <= rsi <= 50.0):
+        elif (bearish_cross or bearish_trend) and (32.0 <= rsi <= 50.0):
+            if self._get_active_module_count("A") >= config["max_pos"] or not self._check_portfolio_heat():
+                return
             await self._switch_module(symbol, "A")
-            config = REGIME_CONFIG["TREND"]
-            if self._get_active_module_count("A") >= config["max_pos"]:
-                return
-            if not self._check_portfolio_heat():
-                return
-
-            await self.client.update_leverage(symbol, config["leverage"])
+            try:
+                await self.client.update_leverage(symbol, config["leverage"])
+            except Exception as e:
+                logger.debug(f"[{symbol}] Leverage update notice: {e}")
             qty = await self.calculate_risk_position_size(symbol, close, atr)
-            await self.place_directional_order(symbol, "SELL", close, qty, atr)
+            await self.place_directional_order(symbol, "SELL", close, qty, atr, module="A")
 
-    # -------------------------------------------------------------------------
-    # Module B: Grid/Mean Reversion (renamed from execute_grid_module)
-    # -------------------------------------------------------------------------
-    async def execute_grid_module(self, symbol: str, mid_price: float):
-        await self._switch_module(symbol, "B")
-        config = REGIME_CONFIG["MEAN_REV"]
-        if self._get_active_module_count("B") >= config["max_pos"]:
+    async def execute_funding_module(self, symbol: str, mid_price: float):
+        funding = self.funding_rates.get(symbol, 0.0)
+        df = self.md_manager.get_dataframe(symbol)
+        if len(df) < 14:
             return
 
-        await self.client.update_leverage(symbol, config["leverage"])
-        # Call the original grid logic
-        await self._execute_grid_logic(symbol, mid_price)
+        df = TechnicalIndicators.calculate_indicators(df)
+        latest = df.iloc[-1]
+        rsi = float(latest["rsi"]) if not pd.isna(latest["rsi"]) else 50.0
+        atr = float(latest["atr"]) if not pd.isna(latest["atr"]) else mid_price * 0.002
 
-    async def _execute_grid_logic(self, symbol: str, mid_price: float):
-        """Original grid execution logic."""
-        await self.clear_grid_orders(symbol)
-        dec = DECIMALS_MAP.get(symbol)
-        min_qty = 10 ** (-(dec.quantity_decimals if dec else 3))
-        qty = max(min_qty, MIN_NOTIONAL_USD / mid_price)
-        q_str = self.format_qty(symbol, qty)
+        # Exit condition: harvest profit once funding normalizes
+        if symbol in self.positions:
+            pos = self.positions[symbol]
+            if abs(funding) < FUNDING_EXIT_THRESHOLD:
+                logger.info(f"[{symbol}] Module C funding normalized ({funding:.6f}). Closing position...")
+                close_side = "SELL" if pos["size"] > 0 else "BUY"
+                await self.place_directional_order(symbol, close_side, mid_price, abs(pos["size"]), atr, module="C_EXIT")
+                return
 
-        new_order_ids = []
-        offsets = [0.002, 0.004]
+        config = REGIME_CONFIG["FUNDING"]
 
-        for offset in offsets:
-            bid_price = mid_price * (1.0 - offset)
-            ask_price = mid_price * (1.0 + offset)
+        if funding <= FUNDING_LONG_THRESHOLD and rsi < 70:
+            if self._get_active_module_count("C") >= config["max_pos"] or not self._check_portfolio_heat():
+                return
+            await self._switch_module(symbol, "C")
+            try:
+                await self.client.update_leverage(symbol, config["leverage"])
+            except Exception as e:
+                logger.debug(f"[{symbol}] Leverage update notice: {e}")
+            qty = await self.calculate_risk_position_size(symbol, mid_price, atr)
+            await self.place_directional_order(symbol, "BUY", mid_price, qty, atr, module="C")
+            logger.info(f"[{symbol}] Module C LONG: funding={funding:.6f}, RSI={rsi:.1f}")
 
-            bid_str = self.format_price(symbol, bid_price, rounding=ROUND_DOWN)
-            ask_str = self.format_price(symbol, ask_price, rounding=ROUND_UP)
+        elif funding >= FUNDING_SHORT_THRESHOLD and rsi > 30:
+            if self._get_active_module_count("C") >= config["max_pos"] or not self._check_portfolio_heat():
+                return
+            await self._switch_module(symbol, "C")
+            try:
+                await self.client.update_leverage(symbol, config["leverage"])
+            except Exception as e:
+                logger.debug(f"[{symbol}] Leverage update notice: {e}")
+            qty = await self.calculate_risk_position_size(symbol, mid_price, atr)
+            await self.place_directional_order(symbol, "SELL", mid_price, qty, atr, module="C")
+            logger.info(f"[{symbol}] Module C SHORT: funding={funding:.6f}, RSI={rsi:.1f}")
 
-            opts = PlaceOrderOptions(post_only=True, stp_mode="CANCEL_AGGRESSOR")
+    async def execute_breakout_module(self, symbol: str, mid_price: float):
+        df = self.md_manager.get_dataframe(symbol)
+        if len(df) < KELTNER_PERIOD:
+            return
 
-            if not DRY_RUN:
-                try:
-                    b_res = await self.client.place_order(
-                        symbol=symbol, side="BUY", order_type="LIMIT",
-                        quantity=q_str, price=bid_str, time_in_force="GTC", options=opts,
-                        confirmation="ack"
-                    )
-                    if hasattr(b_res, "order_id"):
-                        new_order_ids.append(b_res.order_id)
+        df = TechnicalIndicators.calculate_indicators(df)
+        latest = df.iloc[-1]
 
-                    a_res = await self.client.place_order(
-                        symbol=symbol, side="SELL", order_type="LIMIT",
-                        quantity=q_str, price=ask_str, time_in_force="GTC", options=opts,
-                        confirmation="ack"
-                    )
-                    if hasattr(a_res, "order_id"):
-                        new_order_ids.append(a_res.order_id)
-                except OrderError as e:
-                    logger.error(f"[{symbol}] Grid Placement Error ({getattr(e, 'error_code', 'N/A')}): {e}")
+        oi_change = self._get_oi_change(symbol)
+        avg_volume = self._get_avg_volume(symbol)
+        current_volume = float(latest.get("volume", 0) or 0)
+        vol_confirmed = (current_volume > avg_volume * 1.5) if avg_volume > 0 else True
+        atr = float(latest.get("atr", 0) or mid_price * 0.002)
 
-        self.open_grid_orders[symbol] = new_order_ids
+        config = REGIME_CONFIG["BREAKOUT"]
+
+        if latest["close"] > latest["keltner_upper"] and oi_change > OI_SURGE_THRESHOLD and vol_confirmed:
+            if self._get_active_module_count("D") >= config["max_pos"] or not self._check_portfolio_heat():
+                return
+            await self._switch_module(symbol, "D")
+            try:
+                await self.client.update_leverage(symbol, config["leverage"])
+            except Exception as e:
+                logger.debug(f"[{symbol}] Leverage update notice: {e}")
+            qty = await self.calculate_risk_position_size(symbol, mid_price, atr)
+            await self.place_directional_order(symbol, "BUY", mid_price, qty, atr, module="D")
+            logger.info(f"[{symbol}] Module D LONG: OI_chg={oi_change:.2%}")
+
+        elif latest["close"] < latest["keltner_lower"] and oi_change > OI_SURGE_THRESHOLD and vol_confirmed:
+            if self._get_active_module_count("D") >= config["max_pos"] or not self._check_portfolio_heat():
+                return
+            await self._switch_module(symbol, "D")
+            try:
+                await self.client.update_leverage(symbol, config["leverage"])
+            except Exception as e:
+                logger.debug(f"[{symbol}] Leverage update notice: {e}")
+            qty = await self.calculate_risk_position_size(symbol, mid_price, atr)
+            await self.place_directional_order(symbol, "SELL", mid_price, qty, atr, module="D")
+            logger.info(f"[{symbol}] Module D SHORT: OI_chg={oi_change:.2%}")
+
     # -------------------------------------------------------------------------
-    async def feed_prices_from_rest(self):
-        """Background feeder: implied mark from public open-interest every FEED_INTERVAL_SECONDS.
+    # Regime Switching & Feeders
+    # -------------------------------------------------------------------------
+    def _get_oi_change(self, symbol: str, hours: int = OI_LOOKBACK_HOURS) -> float:
+        history = self.oi_history.get(symbol)
+        if not history or len(history) < 2:
+            return 0.0
+        cutoff = time.time() - (hours * 3600)
+        recent = [oi for ts, oi in history if ts >= cutoff]
+        if len(recent) < 2 or recent[0] <= 0:
+            return 0.0
+        return (recent[-1] - recent[0]) / recent[0]
 
-        The testnet edge rejects `trades`/L2 subscriptions on /ws/v1, so this is the
-        primary price feed; MarketDataClient trade ticks supplement it when available.
-        """
+    def _get_avg_volume(self, symbol: str, hours: int = 1) -> float:
+        history = self.volume_history.get(symbol)
+        if not history:
+            return 0.0
+        cutoff = time.time() - (hours * 3600)
+        recent = [vol for ts, vol in history if ts >= cutoff]
+        return (sum(recent) / len(recent)) if recent else 0.0
+
+    def _detect_regime(self, symbol: str) -> str:
+        df = self.md_manager.get_dataframe(symbol)
+        if len(df) < 20:
+            return "WARMUP"
+
+        df = TechnicalIndicators.calculate_indicators(df)
+        latest = df.iloc[-1]
+
+        adx = float(latest.get("adx", 0.0) or 0.0)
+        bb_mid = float(latest.get("bb_mid", 1.0) or 1.0)
+        bb_upper = float(latest.get("bb_upper", 0.0) or 0.0)
+        bb_lower = float(latest.get("bb_lower", 0.0) or 0.0)
+        bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid > 0 else 0.0
+
+        funding = abs(self.funding_rates.get(symbol, 0.0))
+        oi_change = self._get_oi_change(symbol)
+
+        if funding >= FUNDING_SHORT_THRESHOLD:
+            return "FUNDING"
+        elif adx > 25:
+            return "TREND"
+        elif bb_width < 0.015 or abs(oi_change) > OI_SURGE_THRESHOLD:
+            return "BREAKOUT"
+        else:
+            return "MEAN_REV"
+
+    async def _switch_module(self, symbol: str, new_module: str):
+        old_module = self.active_modules.get(symbol)
+        if old_module and old_module != new_module:
+            logger.info(f"[{symbol}] Switching Module {old_module} → {new_module}")
+            if old_module == "B":
+                await self.clear_grid_orders(symbol)
+
+            regime = self._detect_regime(symbol)
+            self.trade_logger.log_regime_switch(symbol, old_module, new_module, regime)
+            if self.telegram.enabled:
+                msg = self.telegram.format_regime_switch(symbol, old_module, new_module, regime)
+                await self.telegram.send(msg)
+
+        self.active_modules[symbol] = new_module
+
+    async def feed_prices_from_rest(self):
         while self.running:
             try:
                 oi_rows = await self.rest_client.get_open_interest()
                 by_sid = {}
                 for row in oi_rows or []:
-                    if isinstance(row, dict) and row.get("symbol_id") in SYMBOL_IDS.values():
-                        by_sid[row.get("symbol_id")] = row
+                    sid = row.get("symbol_id") if isinstance(row, dict) else getattr(row, "symbol_id", None)
+                    if sid in SYMBOL_IDS.values():
+                        by_sid[sid] = row
+
                 for symbol, sid in SYMBOL_IDS.items():
                     row = by_sid.get(sid)
                     if not row:
                         continue
-                    oi = float(row.get("open_interest") or 0)
-                    ccy = float(row.get("oi_ccy") or 0)
+                    oi = float(row.get("open_interest") if isinstance(row, dict) else getattr(row, "open_interest", 0) or 0)
+                    ccy = float(row.get("oi_ccy") if isinstance(row, dict) else getattr(row, "oi_ccy", 0) or 0)
                     if oi > 0 and ccy > 0:
-                        self.md_manager.push_tick(symbol, ccy / oi)
+                        price = ccy / oi
+                        self.md_manager.push_tick(symbol, price)
+                        self.oi_history[symbol].append((time.time(), oi))
+                    else:
+                        mark = float(row.get("mark_price", 0) if isinstance(row, dict) else getattr(row, "mark_price", 0) or 0)
+                        if mark > 0:
+                            self.md_manager.push_tick(symbol, mark)
             except Exception as e:
-                logger.debug(f"REST price feeder error: {e}")
+                logger.debug(f"REST price feeder notice: {e}")
             await asyncio.sleep(FEED_INTERVAL_SECONDS)
 
     async def evaluate_symbol(self, symbol: str):
-        """Evaluate symbol using regime-based strategy routing."""
-        # Check warmup
         df = self.md_manager.get_dataframe(symbol)
         if len(df) < 20:
-            logger.info(f"[{symbol}] Insufficient price history ({len(df)}/20 candles). Warming up...")
+            logger.info(f"[{symbol}] Warming up: {len(df)}/20 ticks recorded.")
             return
 
-        # Detect regime
         regime = self._detect_regime(symbol)
         config = REGIME_CONFIG.get(regime)
-
         if not config or regime == "WARMUP":
             return
 
-        # Check module position limits
-        module = config["module"]
-        if self._get_active_module_count(module) >= config["max_pos"]:
-            return
-
-        # Check portfolio heat
-        if not self._check_portfolio_heat():
-            return
-
-        # Set leverage for this module
-        try:
-            await self.client.update_leverage(symbol, config["leverage"])
-        except Exception as e:
-            logger.warning(f"[{symbol}] Could not update leverage: {e}")
-
-        # Get mid price
         mid_price = self.md_manager.current_mids.get(symbol)
-        if not mid_price:
+        if not mid_price or mid_price <= 0:
             return
 
-        # Switch to new module (clears old orders if needed)
-        await self._switch_module(symbol, module)
-
-        # Route to appropriate module
+        module = config["module"]
         if module == "A":
             await self.execute_trend_module(symbol, mid_price)
         elif module == "B":
@@ -893,73 +922,58 @@ except OrderError as e:
             await self.execute_funding_module(symbol, mid_price)
         elif module == "D":
             await self.execute_breakout_module(symbol, mid_price)
-        else:
-            logger.info(f"[{symbol}] Regime {regime} -> Module {module}: Monitoring...")
 
     # -------------------------------------------------------------------------
-    # WebSocket & Listener Handlers
+    # WebSocket Listeners
     # -------------------------------------------------------------------------
     async def listen_order_updates(self):
         try:
             async for update in self.client.order_updates():
-                logger.info(f"Order Update Stream Payload: {update}")
+                logger.info(f"Order Update Stream: {update}")
+                await self.sync_positions()
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"Error in order updates consumer: {e}")
+            logger.error(f"Order update consumer error: {e}")
 
     async def setup_market_data_stream(self):
-        """Subscribe to public channels for keepalive and strategy data."""
-        # Subscribe to public channels for keepalive and strategy data
         try:
-            await self.client.subscribe(["funding_rate", "open_interest", "volume"])
-            logger.info("Subscribed to funding_rate, open_interest, volume for WebSocket keepalive")
+            await self.client.subscribe(["funding_rate", "open_interest", "volume", "orders"])
+            logger.info("Subscribed to WebSocket channels: funding_rate, open_interest, volume, orders")
         except Exception as e:
-            logger.warning(f"Failed to subscribe to public channels: {e}")
+            logger.warning(f"Failed subscribing to WS channels: {e}")
 
-        # Register callbacks for public market data
-        self.client.on_funding_rate_update(self._handle_funding_rate)
-        self.client.on_open_interest_snapshot(self._handle_open_interest)
-        self.client.on_volume_snapshot(self._handle_volume)
-
-        if os.getenv("GODARK_ENABLE_TRADES", "").lower() not in ("1", "true", "yes"):
-            logger.info("Trade-tick WS disabled (edge rejects `trades` subs); using REST implied-mark feeder.")
-            return
-        self.md_client = MarketDataClient(base_url=WS_URL)
-        await self.md_client.connect()
-
-        for symbol in SYMBOLS:
-            await self.md_client.subscribe_trades(
-                symbol,
-                callback=lambda tick, s=symbol: self.md_manager.push_tick(
-                    s, float(tick.get("price", 0))
-                ),
-            )
+        for event_name, handler in [
+            ("on_funding_rate_update", self._handle_funding_rate),
+            ("on_open_interest_snapshot", self._handle_open_interest),
+            ("on_volume_snapshot", self._handle_volume),
+        ]:
+            if hasattr(self.client, event_name):
+                try:
+                    getattr(self.client, event_name)(handler)
+                except Exception as e:
+                    logger.debug(f"Could not bind listener {event_name}: {e}")
 
     def _handle_funding_rate(self, update):
-        """Handle funding rate updates from WS."""
-        # update is a FundingRateUpdate object
-        symbol = getattr(update, "symbol", None)
-        rate = getattr(update, "funding_rate", None)
+        symbol = getattr(update, "symbol", None) or (update.get("symbol") if isinstance(update, dict) else None)
+        rate = getattr(update, "funding_rate", None) or (update.get("funding_rate") if isinstance(update, dict) else None)
         if symbol and rate is not None:
             self.funding_rates[symbol] = float(rate)
-            logger.debug(f"[{symbol}] Funding rate updated: {float(rate):.6f}")
 
     def _handle_open_interest(self, msg):
-        """Handle open interest snapshot from WS."""
-        # msg is a dict with open_interest_snapshot data
-        for item in msg.get("data", []):
-            symbol = item.get("symbol")
-            oi = float(item.get("open_interest", 0))
-            if symbol in self.oi_history:
+        items = msg.get("data", []) if isinstance(msg, dict) else getattr(msg, "data", [])
+        for item in items:
+            symbol = item.get("symbol") if isinstance(item, dict) else getattr(item, "symbol", None)
+            oi = float(item.get("open_interest", 0) if isinstance(item, dict) else getattr(item, "open_interest", 0) or 0)
+            if symbol in self.oi_history and oi > 0:
                 self.oi_history[symbol].append((time.time(), oi))
 
     def _handle_volume(self, msg):
-        """Handle volume snapshot from WS."""
-        for item in msg.get("data", []):
-            symbol = item.get("symbol")
-            vol = float(item.get("volume", 0))
-            if symbol in self.volume_history:
+        items = msg.get("data", []) if isinstance(msg, dict) else getattr(msg, "data", [])
+        for item in items:
+            symbol = item.get("symbol") if isinstance(item, dict) else getattr(item, "symbol", None)
+            vol = float(item.get("volume", 0) if isinstance(item, dict) else getattr(item, "volume", 0) or 0)
+            if symbol in self.volume_history and vol > 0:
                 self.volume_history[symbol].append((time.time(), vol))
 
     async def run_trading_loop(self):
@@ -968,14 +982,20 @@ except OrderError as e:
             try:
                 await self.client.update_leverage(symbol, DEFAULT_LEVERAGE)
             except Exception as e:
-                logger.warning(f"Could not update leverage for {symbol}: {e}")
+                logger.warning(f"Leverage initialization warning for {symbol}: {e}")
 
+        await self.sync_positions()
         asyncio.create_task(self.listen_order_updates())
         asyncio.create_task(self.feed_prices_from_rest())
         await self.setup_market_data_stream()
 
-        logger.info("Agent strategy loop fully activated.")
+        logger.info("Agent trading loop activated.")
         while self.running:
+            try:
+                await self.sync_positions()
+            except Exception as e:
+                logger.debug(f"Position sync notice: {e}")
+
             if self.system_health_accepting:
                 for symbol in SYMBOLS:
                     try:
@@ -986,7 +1006,7 @@ except OrderError as e:
             await asyncio.sleep(LOOP_INTERVAL_SECONDS)
 
     async def shutdown(self):
-        logger.info("Initiating graceful agent shutdown...")
+        logger.info("Initiating agent shutdown...")
         self.running = False
         for symbol in SYMBOLS:
             await self.clear_grid_orders(symbol)
@@ -995,7 +1015,7 @@ except OrderError as e:
 
 
 # -----------------------------------------------------------------------------
-# Main Runtime Loop with Connection Backoff
+# Main Runtime Loop
 # -----------------------------------------------------------------------------
 async def main():
     backoff = 2
@@ -1018,22 +1038,18 @@ async def main():
                     rest_base_url=REST_BASE_URL,
                 ) as rest_client:
                     agent = QuantitativeTradingAgent(client, rest_client)
-                    backoff = 2  # Reset exponential backoff on successful handshake
+                    backoff = 2
                     await agent.run_trading_loop()
 
         except AuthenticationError as e:
-            logger.critical(f"FATAL AUTHENTICATION FAILURE: {e}. Stopping process.")
+            logger.critical(f"FATAL AUTHENTICATION FAILURE: {e}. Exiting.")
             break
-
         except SessionError as e:
             logger.warning(f"HPKE Session Error: {e}. Re-authenticating in {backoff}s...")
-
         except (GDXConnectionError, GDXTimeoutError, OSError) as e:
             logger.warning(f"Network Connection Lost: {e}. Retrying in {backoff}s...")
-
         except GodarkError as e:
-            logger.error(f"SDK Specific Error: {e}. Retrying in {backoff}s...")
-
+            logger.error(f"SDK Error: {e}. Retrying in {backoff}s...")
         except Exception as e:
             logger.error(f"Unhandled Agent Exception: {e}. Retrying in {backoff}s...", exc_info=True)
 
