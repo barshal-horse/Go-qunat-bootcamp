@@ -21,6 +21,12 @@ from datetime import datetime
 import httpx
 import pandas as pd
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # -----------------------------------------------------------------------------
 # Telegram Notifier
 # -----------------------------------------------------------------------------
@@ -496,6 +502,7 @@ class QuantitativeTradingAgent:
         self.active_modules: Dict[str, str] = {}
         self.funding_rates: Dict[str, float] = {}
         self.oi_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=300) for s in SYMBOLS}
+        self.volume_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=300) for s in SYMBOLS}
         self.telegram = telegram_notifier
         self.trade_logger = TradeLogger("trades.log")
 
@@ -556,20 +563,33 @@ class QuantitativeTradingAgent:
         try:
             positions_data = await self.rest_client.get_positions()
             if positions_data:
-                items = positions_data if isinstance(positions_data, list) else getattr(positions_data, "positions", [])
+                items = (
+                    positions_data
+                    if isinstance(positions_data, list)
+                    else getattr(positions_data, "rows", None)
+                    or getattr(positions_data, "positions", [])
+                    or []
+                )
                 new_positions = {}
                 for pos in items:
                     sym = pos.get("symbol") if isinstance(pos, dict) else getattr(pos, "symbol", None)
+                    if not sym:
+                        sid = pos.get("symbol_id") if isinstance(pos, dict) else getattr(pos, "symbol_id", None)
+                        if sid:
+                            sym = SYMBOL_BY_ID.get(sid)
                     size = float(pos.get("size", 0) if isinstance(pos, dict) else getattr(pos, "size", 0) or 0)
                     notional = float(pos.get("notional", 0) if isinstance(pos, dict) else getattr(pos, "notional", 0) or 0)
                     entry_price = float(pos.get("entry_price", 0) if isinstance(pos, dict) else getattr(pos, "entry_price", 0) or 0)
+                    side_raw = pos.get("side") if isinstance(pos, dict) else getattr(pos, "side", None)
+                    side_str = str(side_raw.value if hasattr(side_raw, "value") else side_raw or "").upper()
+                    side = "SELL" if "SELL" in side_str else "BUY"
                     if sym and abs(size) > 0:
                         new_positions[sym] = {
                             "symbol": sym,
                             "size": size,
                             "notional": notional if notional != 0 else size * entry_price,
                             "entry_price": entry_price,
-                            "side": "BUY" if size > 0 else "SELL",
+                            "side": side,
                         }
                 self.positions = new_positions
         except Exception as e:
