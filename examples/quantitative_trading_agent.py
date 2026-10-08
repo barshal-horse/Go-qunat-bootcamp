@@ -838,7 +838,9 @@ class QuantitativeTradingAgent:
             return False
 
         size = abs(float(pos["size"]))
-        side = "SELL" if pos["size"] > 0 else "BUY"
+        pos_side = str(pos.get("side", "")).upper()
+        # Closing a BUY/LONG position requires SELL. Closing a SELL/SHORT position requires BUY.
+        side = "SELL" if pos_side == "BUY" else "BUY"
         mid_price = self.md_manager.current_mids.get(symbol)
         if not mid_price or mid_price <= 0:
             return False
@@ -856,7 +858,7 @@ class QuantitativeTradingAgent:
         opts_maker = PlaceOrderOptions(reduce_only=True, post_only=True, stp_mode="CANCEL_AGGRESSOR")
 
         logger.info(
-            f"[{symbol}] Routing position close: {pos.get('side', side)} {q_str} | price={p_str} | reason='{reason}'"
+            f"[{symbol}] Routing position close: {side} {q_str} (closing {pos_side} position) | price={p_str} | reason='{reason}'"
         )
 
         try:
@@ -950,7 +952,7 @@ class QuantitativeTradingAgent:
         tp_threshold = 2.2 * atr_pct
         if pnl_pct >= tp_threshold:
             logger.info(
-                f"[{symbol}] 🎯 TAKE PROFIT TARGET HIT: PnL={pnl_pct:.2%} (+${unrealized_usd:,.2f}) "
+                f"[{symbol}] [TAKE_PROFIT] TARGET HIT: PnL={pnl_pct:.2%} (+${unrealized_usd:,.2f}) "
                 f"reached threshold {tp_threshold:.2%}. Harvesting profit!"
             )
             closed = await self.close_position(symbol, reason=f"take_profit_+{pnl_pct:.2%}")
@@ -961,7 +963,7 @@ class QuantitativeTradingAgent:
         # If position gained >= 1.0x ATR and then pulls back below 0.25x ATR, exit to secure profit
         if peak_pnl >= (1.0 * atr_pct) and pnl_pct < (0.25 * atr_pct):
             logger.info(
-                f"[{symbol}] 🛡️ TRAILING STOP TRIGGERED: peak was {peak_pnl:.2%}, retraced to {pnl_pct:.2%}. "
+                f"[{symbol}] [TRAILING_STOP] TRIGGERED: peak was {peak_pnl:.2%}, retraced to {pnl_pct:.2%}. "
                 f"Locking in +${unrealized_usd:,.2f} profit!"
             )
             closed = await self.close_position(symbol, reason=f"trailing_stop_lock_+{pnl_pct:.2%}")
@@ -972,7 +974,7 @@ class QuantitativeTradingAgent:
         sl_threshold = 1.5 * atr_pct
         if pnl_pct <= -sl_threshold:
             logger.info(
-                f"[{symbol}] 🛑 STOP LOSS HIT: PnL={pnl_pct:.2%} (-${abs(unrealized_usd):,.2f}). "
+                f"[{symbol}] [STOP_LOSS] HIT: PnL={pnl_pct:.2%} (-${abs(unrealized_usd):,.2f}). "
                 f"Cutting loss to preserve capital!"
             )
             closed = await self.close_position(symbol, reason=f"stop_loss_{pnl_pct:.2%}")
@@ -984,13 +986,13 @@ class QuantitativeTradingAgent:
         rsi = float(latest["rsi"]) if not pd.isna(latest["rsi"]) else 50.0
 
         if side == "SELL" and (ema_20 > ema_50) and rsi > 58.0 and pnl_pct < 0.002:
-            logger.info(f"[{symbol}] ⚠️ Bullish reversal detected against SHORT (RSI={rsi:.1f}). Closing early...")
+            logger.info(f"[{symbol}] [REVERSAL] Bullish reversal detected against SHORT (RSI={rsi:.1f}). Closing early...")
             closed = await self.close_position(symbol, reason="trend_reversal_exit")
             if closed:
                 return "reversal_closed"
 
         elif side == "BUY" and (ema_20 < ema_50) and rsi < 42.0 and pnl_pct < 0.002:
-            logger.info(f"[{symbol}] ⚠️ Bearish reversal detected against LONG (RSI={rsi:.1f}). Closing early...")
+            logger.info(f"[{symbol}] [REVERSAL] Bearish reversal detected against LONG (RSI={rsi:.1f}). Closing early...")
             closed = await self.close_position(symbol, reason="trend_reversal_exit")
             if closed:
                 return "reversal_closed"
