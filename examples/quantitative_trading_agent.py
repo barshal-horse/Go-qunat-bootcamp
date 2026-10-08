@@ -108,6 +108,58 @@ class TelegramNotifier:
             f"<b>Module:</b> {old_name} -> {new_name}"
         )
 
+    def format_fill(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        qty: float,
+        realized_pnl: Optional[float] = None,
+        fee: Optional[float] = None,
+        order_id: Optional[str] = None,
+    ) -> str:
+        emoji = "🎯"
+        lines = [
+            f"{emoji} <b>Order Filled</b> {emoji}",
+            f"<b>Symbol:</b> {symbol}",
+            f"<b>Side:</b> {side}",
+            f"<b>Fill Price:</b> {price:,.4f}",
+            f"<b>Fill Qty:</b> {qty}",
+        ]
+        if realized_pnl is not None:
+            pnl_emoji = "🟩" if realized_pnl >= 0 else "🟥"
+            lines.append(f"<b>Realized PnL:</b> {pnl_emoji} ${realized_pnl:,.4f}")
+        if fee is not None:
+            lines.append(f"<b>Est. Fee:</b> ${fee:,.4f}")
+        if order_id:
+            lines.append(f"<b>Order ID:</b> <code>{order_id}</code>")
+        lines.append(f"<b>Time:</b> {datetime.utcnow().strftime('%H:%M:%S UTC')}")
+        return "\n".join(lines)
+
+    def format_close(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        qty: float,
+        reason: str,
+        unrealized_pnl: Optional[float] = None,
+    ) -> str:
+        emoji = "🏁"
+        pnl_str = ""
+        if unrealized_pnl is not None:
+            pnl_emoji = "🟩" if unrealized_pnl >= 0 else "🟥"
+            pnl_str = f"\n<b>Est. PnL:</b> {pnl_emoji} ${unrealized_pnl:,.2f}"
+        return (
+            f"{emoji} <b>Position Closed</b> {emoji}\n"
+            f"<b>Symbol:</b> {symbol}\n"
+            f"<b>Action:</b> {side} {qty}\n"
+            f"<b>Exit Price:</b> {price:,.4f}\n"
+            f"<b>Reason:</b> {reason}"
+            f"{pnl_str}\n"
+            f"<b>Time:</b> {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+        )
+
 
 # -----------------------------------------------------------------------------
 # Trade Logger (JSONL)
@@ -182,6 +234,27 @@ class TradeLogger:
             "old_module": old_module,
             "new_module": new_module,
             "regime": regime,
+        })
+
+    def log_fill(
+        self,
+        symbol: str,
+        side: str,
+        fill_price: float,
+        fill_qty: float,
+        realized_pnl: Optional[float] = None,
+        trading_fee: Optional[float] = None,
+        order_id: Optional[str] = None,
+    ):
+        self._write({
+            "type": "fill",
+            "symbol": symbol,
+            "side": side,
+            "fill_price": fill_price,
+            "fill_qty": fill_qty,
+            "realized_pnl": realized_pnl,
+            "trading_fee": trading_fee,
+            "order_id": order_id,
         })
 
 
@@ -259,7 +332,13 @@ if not all([API_KEY_ID, API_SECRET, PASSPHRASE]):
 REST_BASE_URL = WS_URL.replace("wss://", "https://").replace("ws://", "http://")
 SYMBOLS = ["BTC-USDC-PERP", "ETH-USDC-PERP", "SOL-USDC-PERP"]
 DEFAULT_LEVERAGE = 3
-RISK_FACTOR = 0.015
+# Risk & Capital Architecture (Optimized for $1M pool targeting 30% APR / ~$822/day)
+# 0.20% risk per trade = $2,000 risk budget. At 1% SL = $100k-$120k notional position.
+RISK_FACTOR = 0.002
+MAX_SINGLE_TRADE_NOTIONAL = 120000.0  # Max $120k notional per single trade (~0.12x portfolio leverage)
+MAX_PORTFOLIO_NOTIONAL = 400000.0     # Max $400k total notional across all 3 assets (~0.40x total leverage)
+TRADE_COOLDOWN_SECONDS = 600          # 10-minute cooldown per symbol to eliminate overtrading churn
+
 LOOP_INTERVAL_SECONDS = 15
 FEED_INTERVAL_SECONDS = 2
 MIN_NOTIONAL_USD = 100.0
@@ -272,7 +351,15 @@ SYNC_THROTTLE_SECONDS = 5.0
 REFERENCE_MID_URL = "https://api.hyperliquid.xyz/info"
 REFERENCE_MID_KEYS = {"BTC-USDC-PERP": "BTC", "ETH-USDC-PERP": "ETH", "SOL-USDC-PERP": "SOL"}
 
-# Strategy Parameters
+# Strategy Parameters & Fee Economics
+# Core Tier Default: Maker = 0.015% (1.5 bps), Taker = 0.055% (5.5 bps)
+DEFAULT_MAKER_FEE_PCT = 0.00015
+DEFAULT_TAKER_FEE_PCT = 0.00055
+MAKER_OFFSET_BPS = 0.0003  # 3 bps passive limit offset from mid for maker capture
+MIN_ATR_RATIO = 0.006      # 0.6% price floor for ATR to prevent micro-stops on 2s ticks
+MAX_FEE_TO_PROFIT_RATIO = 0.25  # Block trade if fees+funding exceed 25% of expected TP profit
+REGIME_STABILITY_CYCLES = 2    # Consecutive cycles needed before regime transition
+
 FUNDING_LONG_THRESHOLD = -0.0005
 FUNDING_SHORT_THRESHOLD = 0.0005
 FUNDING_EXIT_THRESHOLD = 0.0001
@@ -308,9 +395,10 @@ class TechnicalIndicators:
 
         df = df.copy()
 
-        # EMAs
+        # EMAs (Micro 20, Meso 50, Macro 100)
         df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
         df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
+        df["ema_100"] = df["close"].ewm(span=100, adjust=False).mean()
 
         # RSI 14
         delta = df["close"].diff()
@@ -379,7 +467,7 @@ class MarketDataManager:
             "volume": volume if volume is not None else 0.0,
         }
         self.price_history[symbol].append(record)
-        if len(self.price_history[symbol]) > 300:
+        if len(self.price_history[symbol]) > 600:
             self.price_history[symbol].pop(0)
 
     def get_dataframe(self, symbol: str) -> pd.DataFrame:
@@ -408,10 +496,23 @@ class QuantitativeTradingAgent:
         self.active_modules: Dict[str, str] = {}
         self.funding_rates: Dict[str, float] = {}
         self.oi_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=300) for s in SYMBOLS}
-        self.volume_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=300) for s in SYMBOLS}
-
         self.telegram = telegram_notifier
         self.trade_logger = TradeLogger("trades.log")
+
+        # Fee Schedule (initialized to Core tier; updated dynamically via VIP API)
+        self.maker_fee_pct: float = DEFAULT_MAKER_FEE_PCT
+        self.taker_fee_pct: float = DEFAULT_TAKER_FEE_PCT
+
+        # Grid state & churn reduction tracking: {symbol: {"mid": float, "time": float}}
+        self.grid_state: Dict[str, Dict] = {s: {"mid": 0.0, "time": 0.0} for s in SYMBOLS}
+
+        # Regime stability hysteresis: {symbol: (pending_regime, consecutive_ticks)}
+        self.regime_pending: Dict[str, Tuple[str, int]] = {}
+
+        # Capital & Trade frequency management
+        self.cached_collateral: float = 1000000.0
+        self.last_trade_time: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
+        self.position_peak_pnl: Dict[str, float] = {}
 
     # -------------------------------------------------------------------------
     # Formatting Helpers
@@ -445,10 +546,11 @@ class QuantitativeTradingAgent:
                     total = getattr(summary, "total_collateral", None) or (summary.get("total_collateral") if isinstance(summary, dict) else None)
                     val = float(free or total or 0)
                     if val > 0:
+                        self.cached_collateral = val
                         return val
         except Exception as e:
             logger.warning(f"Could not fetch account collateral via REST: {e}")
-        return 10000.0
+        return self.cached_collateral
 
     async def sync_positions(self, _retried: bool = False):
         try:
@@ -467,6 +569,7 @@ class QuantitativeTradingAgent:
                             "size": size,
                             "notional": notional if notional != 0 else size * entry_price,
                             "entry_price": entry_price,
+                            "side": "BUY" if size > 0 else "SELL",
                         }
                 self.positions = new_positions
         except Exception as e:
@@ -484,9 +587,8 @@ class QuantitativeTradingAgent:
     def _check_portfolio_heat(self) -> bool:
         try:
             total_notional = sum(abs(pos.get("notional", 0.0)) for pos in self.positions.values())
-            max_notional = 10000.0 * 3.0
-            heat = total_notional / max_notional if max_notional > 0 else 0
-            return heat < MAX_PORTFOLIO_HEAT
+            # Enforce conservative institutional ceiling of $400k max total exposure on $1M pool
+            return total_notional < MAX_PORTFOLIO_NOTIONAL
         except Exception:
             return True
 
@@ -495,19 +597,26 @@ class QuantitativeTradingAgent:
 
     async def calculate_risk_position_size(self, symbol: str, entry_price: float, atr: float) -> float:
         collateral = await self.get_collateral_balance()
+        # 0.20% portfolio risk per trade = ~$2,000 risk budget on $1M pool
         risk_budget = collateral * RISK_FACTOR
-        effective_atr = max(atr if not pd.isna(atr) else 0.0, entry_price * 0.002)
+
+        # Volatility floor: at least MIN_ATR_RATIO (0.6%) of price to prevent micro-stops on 2s ticks
+        min_atr = entry_price * MIN_ATR_RATIO
+        effective_atr = max(atr if not pd.isna(atr) else 0.0, min_atr)
         sl_distance = 1.5 * effective_atr
 
-        raw_qty = risk_budget / sl_distance
-        # Cap notional at 80% of free-collateral margin so the venue never
-        # rejects for MARGIN_INSUFFICIENT (fees + maintenance buffer)...
-        max_notional = collateral * DEFAULT_LEVERAGE * 0.8
-        # ...and never exceed the portfolio-heat budget minus exposure on book.
+        # Deduct estimated round-trip fee buffer from risk budget
+        fee_buffer_mult = (self.maker_fee_pct + self.taker_fee_pct) * DEFAULT_LEVERAGE
+        net_risk_budget = max(risk_budget * (1.0 - fee_buffer_mult), risk_budget * 0.8)
+
+        raw_qty = net_risk_budget / sl_distance
+
+        # Size caps for institutional 30% APR goal:
+        # Cap at MAX_SINGLE_TRADE_NOTIONAL ($120k) and remaining portfolio heat budget
         current_notional = sum(abs(p.get("notional", 0.0)) for p in self.positions.values())
-        heat_budget = max(0.0, MAX_PORTFOLIO_HEAT * 10000.0 * DEFAULT_LEVERAGE - current_notional)
-        max_notional = min(max_notional, heat_budget)
-        max_qty = max_notional / entry_price
+        remaining_heat = max(0.0, MAX_PORTFOLIO_NOTIONAL - current_notional)
+        allowed_notional = min(MAX_SINGLE_TRADE_NOTIONAL, remaining_heat)
+        max_qty = allowed_notional / entry_price
         min_notional_qty = MIN_NOTIONAL_USD / entry_price
 
         final_qty = min(max(raw_qty, min_notional_qty), max_qty)
@@ -573,24 +682,47 @@ class QuantitativeTradingAgent:
     async def place_directional_order(
         self, symbol: str, side: str, price: float, qty: float, atr: float, module: str = "A"
     ):
-        p_str = self.format_price(symbol, price)
-        q_str = self.format_qty(symbol, qty)
-
-        effective_atr = max(atr if not pd.isna(atr) else 0.0, price * 0.002)
+        effective_atr = max(atr if not pd.isna(atr) else 0.0, price * MIN_ATR_RATIO)
         sl = price - (1.5 * effective_atr) if side == "BUY" else price + (1.5 * effective_atr)
-        tp = price + (3.0 * effective_atr) if side == "BUY" else price - (3.0 * effective_atr)
 
+        # Fee-adjusted TP target: 3.0 * ATR + round-trip fee drag to guarantee positive expectancy
+        fee_drag = price * (self.maker_fee_pct * 2.0)
+        tp = price + (3.0 * effective_atr) + fee_drag if side == "BUY" else price - (3.0 * effective_atr) - fee_drag
+
+        # Fee & Funding Pre-Trade Gate:
+        expected_profit = abs(tp - price) * qty
+        expected_fees = (price * qty) * (self.maker_fee_pct * 2.0)
+        expected_funding = (price * qty) * abs(self.funding_rates.get(symbol, 0.0)) * 2.0
+        total_friction = expected_fees + expected_funding
+        if expected_profit > 0 and (total_friction / expected_profit) > MAX_FEE_TO_PROFIT_RATIO:
+            logger.info(
+                f"[{symbol}] MODULE {module} trade blocked: total friction ${total_friction:.2f} "
+                f"exceeds {MAX_FEE_TO_PROFIT_RATIO:.0%} of expected profit ${expected_profit:.2f}"
+            )
+            return False
+
+        # Maker Limit Pricing: offset price by MAKER_OFFSET_BPS (3 bps) passive
+        # to guarantee execution as MAKER (0.015% fee) instead of crossing as TAKER (0.055% fee)
+        if side == "BUY":
+            target_price = price * (1.0 - MAKER_OFFSET_BPS)
+            p_str = self.format_price(symbol, target_price, rounding=ROUND_DOWN)
+        else:
+            target_price = price * (1.0 + MAKER_OFFSET_BPS)
+            p_str = self.format_price(symbol, target_price, rounding=ROUND_UP)
+
+        q_str = self.format_qty(symbol, qty)
         sl_str = self.format_price(symbol, sl)
         tp_str = self.format_price(symbol, tp)
 
         opts = PlaceOrderOptions(
             stop_loss_price=sl_str,
             take_profit_price=tp_str,
+            post_only=True,
             stp_mode="CANCEL_AGGRESSOR",
         )
 
         logger.info(
-            f"[{symbol}] MODULE {module} Signal -> Side: {side} | Price: {p_str} | Qty: {q_str} | "
+            f"[{symbol}] MODULE {module} Signal (Maker) -> Side: {side} | Price: {p_str} | Qty: {q_str} | "
             f"SL: {sl_str} | TP: {tp_str}"
         )
 
@@ -627,11 +759,36 @@ class QuantitativeTradingAgent:
             order_id = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
             error = getattr(ack, "error", None) or getattr(ack, "error_code", None)
 
+            # Retry once with slightly wider passive offset if post_only would cross
+            if not success:
+                err_str = str(error or "").upper()
+                if "POST_ONLY" in err_str or "CROSS" in err_str:
+                    logger.info(f"[{symbol}] Maker post_only would cross, retrying once with 6 bps passive offset...")
+                    if side == "BUY":
+                        retry_price = price * (1.0 - 0.0006)
+                        retry_p_str = self.format_price(symbol, retry_price, rounding=ROUND_DOWN)
+                    else:
+                        retry_price = price * (1.0 + 0.0006)
+                        retry_p_str = self.format_price(symbol, retry_price, rounding=ROUND_UP)
+                    ack = await self.client.place_order(
+                        symbol=symbol,
+                        side=to_sdk_side(side),
+                        order_type=OrderType.LIMIT,
+                        quantity=q_str,
+                        price=retry_p_str,
+                        time_in_force=TimeInForce.GTC,
+                        options=opts,
+                    )
+                    success = getattr(ack, "success", True)
+                    order_id = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
+                    error = getattr(ack, "error", None) or getattr(ack, "error_code", None)
+
             if not success:
                 logger.error(f"[{symbol}] Order rejected by venue: error={error}")
                 return False
 
             logger.info(f"[{symbol}] Order successfully accepted: order_id={order_id}")
+            self.last_trade_time[symbol] = time.time()
             regime = self._detect_regime(symbol)
 
             self.trade_logger.log_trade(
@@ -651,8 +808,187 @@ class QuantitativeTradingAgent:
             logger.error(f"[{symbol}] Order Error ({getattr(e, 'error_code', 'N/A')}): {e}")
             return False
         except Exception as e:
-            logger.error(f"[{symbol}] Unexpected order placement failure: {e}", exc_info=True)
+            logger.error(f"[{symbol}] Unexpected Error placing order: {e}", exc_info=True)
             return False
+
+    async def close_position(self, symbol: str, reason: str = "exit") -> bool:
+        """Actively close an open position with reduce_only to harvest profit or cut loss."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return False
+
+        size = abs(float(pos["size"]))
+        side = "SELL" if pos["size"] > 0 else "BUY"
+        mid_price = self.md_manager.current_mids.get(symbol)
+        if not mid_price or mid_price <= 0:
+            return False
+
+        q_str = self.format_qty(symbol, size)
+
+        # 1. Try passive Maker exit first to capture maker fees (0.015%)
+        if side == "BUY":
+            target_price = mid_price * (1.0 - MAKER_OFFSET_BPS)
+            p_str = self.format_price(symbol, target_price, rounding=ROUND_DOWN)
+        else:
+            target_price = mid_price * (1.0 + MAKER_OFFSET_BPS)
+            p_str = self.format_price(symbol, target_price, rounding=ROUND_UP)
+
+        opts_maker = PlaceOrderOptions(reduce_only=True, post_only=True, stp_mode="CANCEL_AGGRESSOR")
+
+        logger.info(
+            f"[{symbol}] Routing position close: {pos.get('side', side)} {q_str} | price={p_str} | reason='{reason}'"
+        )
+
+        try:
+            ack = await self.client.place_order(
+                symbol=symbol,
+                side=to_sdk_side(side),
+                order_type=OrderType.LIMIT,
+                quantity=q_str,
+                price=p_str,
+                time_in_force=TimeInForce.GTC,
+                options=opts_maker,
+            )
+            success = getattr(ack, "success", True)
+            oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
+
+            # 2. If maker post_only crossed or rejected, fallback to aggressive IOC reduce_only to guarantee capital protection
+            if not success or not oid:
+                logger.info(f"[{symbol}] Maker close would cross/rejected. Routing IOC reduce_only to guarantee execution...")
+                opts_ioc = PlaceOrderOptions(reduce_only=True, post_only=False, stp_mode="CANCEL_AGGRESSOR")
+                agg_price = mid_price * (1.001 if side == "BUY" else 0.999)
+                ack = await self.client.place_order(
+                    symbol=symbol,
+                    side=to_sdk_side(side),
+                    order_type=OrderType.LIMIT,
+                    quantity=q_str,
+                    price=self.format_price(symbol, agg_price),
+                    time_in_force=TimeInForce.IOC,
+                    options=opts_ioc,
+                )
+                success = getattr(ack, "success", True)
+                oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
+
+            if success and oid:
+                logger.info(f"[{symbol}] Position closed successfully: order_id={oid} reason='{reason}'")
+                self.last_trade_time[symbol] = time.time()
+                self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
+                if self.telegram.enabled:
+                    entry = float(pos.get("entry_price", mid_price))
+                    pnl_pct = (mid_price - entry) / entry if pos["size"] > 0 else (entry - mid_price) / entry
+                    msg = self.telegram.format_close(
+                        symbol=symbol,
+                        side=side,
+                        price=mid_price,
+                        qty=size,
+                        reason=reason,
+                        unrealized_pnl=pnl_pct * (entry * size),
+                    )
+                    await self.telegram.send(msg)
+
+                await asyncio.sleep(1.0)
+                await self.sync_positions()
+                return True
+            else:
+                logger.warning(f"[{symbol}] Position close failed: {getattr(ack, 'error', None) or getattr(ack, 'error_code', None)}")
+        except Exception as e:
+            logger.error(f"[{symbol}] Exception executing position close: {e}", exc_info=True)
+        return False
+
+    async def manage_open_position(self, symbol: str, mid_price: float) -> str:
+        """Institutional active position manager: trails profits, triggers TP, cuts losses, and exits on reversals."""
+        pos = self.positions.get(symbol)
+        if not pos or not mid_price or mid_price <= 0:
+            return "no_position"
+
+        entry = float(pos["entry_price"])
+        size = abs(float(pos["size"]))
+        side = pos.get("side", "BUY" if pos["size"] > 0 else "SELL")
+
+        df = self.md_manager.get_dataframe(symbol)
+        if len(df) < 20:
+            return "warming_up"
+
+        df = TechnicalIndicators.calculate_indicators(df)
+        latest = df.iloc[-1]
+        calc_atr = float(latest.get("atr", 0.0) or 0.0)
+        atr = max(calc_atr, entry * MIN_ATR_RATIO)
+
+        # Unrealized PnL percentage and USD amount
+        pnl_pct = (mid_price - entry) / entry if side == "BUY" else (entry - mid_price) / entry
+        unrealized_usd = pnl_pct * (entry * size)
+
+        # Track Peak Favorable Excursion (PFE) for trailing stops
+        peak_key = f"{symbol}_{side}"
+        self.position_peak_pnl[peak_key] = max(self.position_peak_pnl.get(peak_key, 0.0), pnl_pct)
+        peak_pnl = self.position_peak_pnl[peak_key]
+
+        atr_pct = atr / entry
+
+        # 1. Take Profit: Lock in gains at 2.2x ATR (~1.3% - 1.8% gain)
+        # On a $100k notional position, this locks in +$1,300 to +$1,800 net cash!
+        tp_threshold = 2.2 * atr_pct
+        if pnl_pct >= tp_threshold:
+            logger.info(
+                f"[{symbol}] 🎯 TAKE PROFIT TARGET HIT: PnL={pnl_pct:.2%} (+${unrealized_usd:,.2f}) "
+                f"reached threshold {tp_threshold:.2%}. Harvesting profit!"
+            )
+            closed = await self.close_position(symbol, reason=f"take_profit_+{pnl_pct:.2%}")
+            if closed:
+                return "harvested_profit"
+
+        # 2. Dynamic Trailing Stop / Breakeven Lock:
+        # If position gained >= 1.0x ATR and then pulls back below 0.25x ATR, exit to secure profit
+        if peak_pnl >= (1.0 * atr_pct) and pnl_pct < (0.25 * atr_pct):
+            logger.info(
+                f"[{symbol}] 🛡️ TRAILING STOP TRIGGERED: peak was {peak_pnl:.2%}, retraced to {pnl_pct:.2%}. "
+                f"Locking in +${unrealized_usd:,.2f} profit!"
+            )
+            closed = await self.close_position(symbol, reason=f"trailing_stop_lock_+{pnl_pct:.2%}")
+            if closed:
+                return "trailing_stop_closed"
+
+        # 3. Protective Stop Loss: Cut loss if trade drops to -1.5x ATR
+        sl_threshold = 1.5 * atr_pct
+        if pnl_pct <= -sl_threshold:
+            logger.info(
+                f"[{symbol}] 🛑 STOP LOSS HIT: PnL={pnl_pct:.2%} (-${abs(unrealized_usd):,.2f}). "
+                f"Cutting loss to preserve capital!"
+            )
+            closed = await self.close_position(symbol, reason=f"stop_loss_{pnl_pct:.2%}")
+            if closed:
+                return "stop_loss_closed"
+
+        # 4. Momentum / Trend Invalidation:
+        ema_20, ema_50 = float(latest["ema_20"]), float(latest["ema_50"])
+        rsi = float(latest["rsi"]) if not pd.isna(latest["rsi"]) else 50.0
+
+        if side == "SELL" and (ema_20 > ema_50) and rsi > 58.0 and pnl_pct < 0.002:
+            logger.info(f"[{symbol}] ⚠️ Bullish reversal detected against SHORT (RSI={rsi:.1f}). Closing early...")
+            closed = await self.close_position(symbol, reason="trend_reversal_exit")
+            if closed:
+                return "reversal_closed"
+
+        elif side == "BUY" and (ema_20 < ema_50) and rsi < 42.0 and pnl_pct < 0.002:
+            logger.info(f"[{symbol}] ⚠️ Bearish reversal detected against LONG (RSI={rsi:.1f}). Closing early...")
+            closed = await self.close_position(symbol, reason="trend_reversal_exit")
+            if closed:
+                return "reversal_closed"
+
+        # 5. Funding Headwind Invalidation (Carry Protection)
+        funding = self.funding_rates.get(symbol, 0.0)
+        if side == "SELL" and funding < -0.0003:
+            logger.info(f"[{symbol}] Funding turned punitive ({funding:.6f}) against SHORT. Closing carry...")
+            closed = await self.close_position(symbol, reason="funding_flip_exit")
+            if closed:
+                return "funding_flip_closed"
+        elif side == "BUY" and funding > 0.0003:
+            logger.info(f"[{symbol}] Funding turned punitive ({funding:.6f}) against LONG. Closing carry...")
+            closed = await self.close_position(symbol, reason="funding_flip_exit")
+            if closed:
+                return "funding_flip_closed"
+
+        return f"active_{side}_pnl={pnl_pct:.2%}_(+${unrealized_usd:,.2f})"
 
     async def clear_grid_orders(self, symbol: str):
         order_ids = self.open_grid_orders.get(symbol, [])
@@ -669,12 +1005,28 @@ class QuantitativeTradingAgent:
         self.open_grid_orders[symbol] = []
 
     async def execute_grid_module(self, symbol: str, mid_price: float):
+        if symbol in self.positions:
+            return "has_active_position"
         await self._switch_module(symbol, "B")
         config = REGIME_CONFIG["MEAN_REV"]
         if self._get_active_module_count("B") > config["max_pos"]:
             return "blocked_max_pos"
         if not self._check_portfolio_heat():
             return "blocked_heat"
+
+        # Grid Churn Reduction:
+        # If orders are already resting, price moved < 15 bps, and placed < 90s ago, keep resting
+        last_grid = self.grid_state.get(symbol, {})
+        last_mid = last_grid.get("mid", 0.0)
+        last_time = last_grid.get("time", 0.0)
+        active_ids = self.open_grid_orders.get(symbol, [])
+        now_ts = time.time()
+
+        if active_ids and last_mid > 0:
+            price_drift = abs(mid_price - last_mid) / last_mid
+            if price_drift < 0.0015 and (now_ts - last_time) < 90.0:
+                logger.debug(f"[{symbol}] Grid resting orders stable (drift={price_drift:.2%}), skipping re-quote.")
+                return "grid_stable"
 
         await self.clear_grid_orders(symbol)
         await self._set_leverage(symbol, config["leverage"])
@@ -684,8 +1036,21 @@ class QuantitativeTradingAgent:
         qty = max(min_qty, MIN_NOTIONAL_USD / mid_price)
         q_str = self.format_qty(symbol, qty)
 
+        # Dynamic ATR offsets: minimum 35 bps to clear maker fee (0.03% RT) comfortably
+        df = self.md_manager.get_dataframe(symbol)
+        atr = mid_price * MIN_ATR_RATIO
+        if len(df) >= 14:
+            df_ind = TechnicalIndicators.calculate_indicators(df)
+            calc_atr = float(df_ind.iloc[-1].get("atr", 0.0) or 0.0)
+            if calc_atr > 0:
+                atr = max(calc_atr, mid_price * MIN_ATR_RATIO)
+
+        atr_pct = atr / mid_price
+        offset_1 = max(0.0035, 0.35 * atr_pct)
+        offset_2 = offset_1 * 2.0
+        offsets = [offset_1, offset_2]
+
         new_order_ids = []
-        offsets = [0.002, 0.004]
 
         for offset in offsets:
             bid_price = mid_price * (1.0 - offset)
@@ -740,11 +1105,13 @@ class QuantitativeTradingAgent:
                 new_order_ids.extend(["SIM_BID_" + bid_str, "SIM_ASK_" + ask_str])
 
         self.open_grid_orders[symbol] = new_order_ids
+        self.grid_state[symbol] = {"mid": mid_price, "time": now_ts}
+
         if new_order_ids:
             self.trade_logger.log_grid(
                 symbol=symbol,
-                bid_price=mid_price * 0.998,
-                ask_price=mid_price * 1.002,
+                bid_price=mid_price * (1.0 - offset_1),
+                ask_price=mid_price * (1.0 + offset_1),
                 qty=qty,
                 order_ids=new_order_ids,
                 module="B",
@@ -752,8 +1119,8 @@ class QuantitativeTradingAgent:
             if self.telegram.enabled:
                 msg = self.telegram.format_grid(
                     symbol=symbol,
-                    bid_price=mid_price * 0.998,
-                    ask_price=mid_price * 1.002,
+                    bid_price=mid_price * (1.0 - offset_1),
+                    ask_price=mid_price * (1.0 + offset_1),
                     qty=qty,
                     order_ids=new_order_ids,
                 )
@@ -765,6 +1132,9 @@ class QuantitativeTradingAgent:
     # Strategy Modules
     # -------------------------------------------------------------------------
     async def execute_trend_module(self, symbol: str, mid_price: float):
+        if symbol in self.positions:
+            return "already_positioned"
+
         df = self.md_manager.get_dataframe(symbol)
         if len(df) < 20:
             return "warming_up"
@@ -777,7 +1147,19 @@ class QuantitativeTradingAgent:
         ema_20, ema_50 = float(latest["ema_20"]), float(latest["ema_50"])
         prev_ema20, prev_ema50 = float(prev["ema_20"]), float(prev["ema_50"])
         rsi = float(latest["rsi"]) if not pd.isna(latest["rsi"]) else 50.0
-        atr = float(latest["atr"]) if not pd.isna(latest["atr"]) else close * 0.002
+        calc_atr = float(latest["atr"]) if not pd.isna(latest["atr"]) else 0.0
+        atr = max(calc_atr, close * MIN_ATR_RATIO)
+        adx = float(latest.get("adx", 0.0) or 0.0)
+        funding = self.funding_rates.get(symbol, 0.0)
+
+        # High-Winrate Filter 1: ADX confirmation (market must be trending, not choppy)
+        if adx < 22.0:
+            return "low_adx"
+
+        # High-Winrate Filter 2: EMA Separation Buffer (eliminates micro-touches & false crosses)
+        ema_spread = abs(ema_20 - ema_50)
+        if ema_spread < (0.10 * atr):
+            return "tight_ema_spread"
 
         bullish_cross = (prev_ema20 <= prev_ema50) and (ema_20 > ema_50)
         bearish_cross = (prev_ema20 >= prev_ema50) and (ema_20 < ema_50)
@@ -786,22 +1168,28 @@ class QuantitativeTradingAgent:
 
         config = REGIME_CONFIG["TREND"]
 
-        if (bullish_cross or bullish_trend) and (50.0 <= rsi <= 68.0):
+        # LONG: confirmed bullish momentum, RSI corridor (52-66), no punitive funding headwind
+        if (bullish_cross or bullish_trend) and (52.0 <= rsi <= 66.0) and (funding <= 0.0004):
             if self._get_active_module_count("A") >= config["max_pos"] or not self._check_portfolio_heat():
                 return "blocked_risk"
             await self._switch_module(symbol, "A")
             await self._set_leverage(symbol, config["leverage"])
-            qty = await self.calculate_risk_position_size(symbol, close, atr)
-            ok = await self.place_directional_order(symbol, "BUY", close, qty, atr, module="A")
+            # Pullback pricing anchor: enter near EMA20 or close
+            entry_price = min(close, ema_20 * 1.001)
+            qty = await self.calculate_risk_position_size(symbol, entry_price, atr)
+            ok = await self.place_directional_order(symbol, "BUY", entry_price, qty, atr, module="A")
             return "entered_long" if ok else "order_rejected"
 
-        elif (bearish_cross or bearish_trend) and (32.0 <= rsi <= 50.0):
+        # SHORT: confirmed bearish momentum, RSI corridor (34-48), no punitive funding headwind
+        elif (bearish_cross or bearish_trend) and (34.0 <= rsi <= 48.0) and (funding >= -0.0004):
             if self._get_active_module_count("A") >= config["max_pos"] or not self._check_portfolio_heat():
                 return "blocked_risk"
             await self._switch_module(symbol, "A")
             await self._set_leverage(symbol, config["leverage"])
-            qty = await self.calculate_risk_position_size(symbol, close, atr)
-            ok = await self.place_directional_order(symbol, "SELL", close, qty, atr, module="A")
+            # Pullback pricing anchor: enter near EMA20 or close
+            entry_price = max(close, ema_20 * 0.999)
+            qty = await self.calculate_risk_position_size(symbol, entry_price, atr)
+            ok = await self.place_directional_order(symbol, "SELL", entry_price, qty, atr, module="A")
             return "entered_short" if ok else "order_rejected"
 
         return "no_signal"
@@ -825,10 +1213,11 @@ class QuantitativeTradingAgent:
                 close_side = "SELL" if pos["size"] > 0 else "BUY"
                 ok = await self.place_directional_order(symbol, close_side, mid_price, abs(pos["size"]), atr, module="C_EXIT")
                 return "exit_placed" if ok else "order_rejected"
+            return "already_positioned"
 
         config = REGIME_CONFIG["FUNDING"]
 
-        if funding <= FUNDING_LONG_THRESHOLD and rsi < 70:
+        if funding <= FUNDING_LONG_THRESHOLD and rsi < 65:
             if self._get_active_module_count("C") >= config["max_pos"] or not self._check_portfolio_heat():
                 return "blocked_risk"
             await self._switch_module(symbol, "C")
@@ -838,7 +1227,7 @@ class QuantitativeTradingAgent:
             logger.info(f"[{symbol}] Module C LONG: funding={funding:.6f}, RSI={rsi:.1f}")
             return "entered_long" if ok else "order_rejected"
 
-        elif funding >= FUNDING_SHORT_THRESHOLD and rsi > 30:
+        elif funding >= FUNDING_SHORT_THRESHOLD and rsi > 35:
             if self._get_active_module_count("C") >= config["max_pos"] or not self._check_portfolio_heat():
                 return "blocked_risk"
             await self._switch_module(symbol, "C")
@@ -851,6 +1240,9 @@ class QuantitativeTradingAgent:
         return "no_signal"
 
     async def execute_breakout_module(self, symbol: str, mid_price: float):
+        if symbol in self.positions:
+            return "already_positioned"
+
         df = self.md_manager.get_dataframe(symbol)
         if len(df) < KELTNER_PERIOD:
             return "warming_up"
@@ -864,7 +1256,8 @@ class QuantitativeTradingAgent:
         if current_volume <= 0 and self.volume_history.get(symbol):
             current_volume = self.volume_history[symbol][-1][1]
         vol_confirmed = (current_volume > avg_volume * 1.5) if avg_volume > 0 else True
-        atr = float(latest.get("atr", 0) or mid_price * 0.002)
+        calc_atr = float(latest.get("atr", 0.0) or 0.0)
+        atr = max(calc_atr, mid_price * MIN_ATR_RATIO)
 
         config = REGIME_CONFIG["BREAKOUT"]
 
@@ -938,13 +1331,37 @@ class QuantitativeTradingAgent:
         oi_change = self._get_oi_change(symbol)
 
         if funding >= FUNDING_SHORT_THRESHOLD:
-            return "FUNDING"
+            raw_regime = "FUNDING"
         elif adx > 25:
-            return "TREND"
+            raw_regime = "TREND"
         elif oi_change > OI_SURGE_THRESHOLD or self._volume_surge(symbol):
-            return "BREAKOUT"
+            raw_regime = "BREAKOUT"
         else:
-            return "MEAN_REV"
+            raw_regime = "MEAN_REV"
+
+        # Apply regime stability filter to prevent rapid churn
+        current_mod = self.active_modules.get(symbol)
+        current_regime = None
+        for r_name, r_cfg in REGIME_CONFIG.items():
+            if r_cfg["module"] == current_mod:
+                current_regime = r_name
+                break
+
+        if current_regime and raw_regime != current_regime:
+            pending_regime, count = self.regime_pending.get(symbol, (raw_regime, 0))
+            if pending_regime == raw_regime:
+                count += 1
+            else:
+                pending_regime = raw_regime
+                count = 1
+            self.regime_pending[symbol] = (pending_regime, count)
+
+            if count < REGIME_STABILITY_CYCLES:
+                # Retain current regime until new regime signal persists across consecutive cycles
+                return current_regime
+
+        self.regime_pending[symbol] = (raw_regime, 0)
+        return raw_regime
 
     async def _switch_module(self, symbol: str, new_module: str):
         old_module = self.active_modules.get(symbol)
@@ -1029,7 +1446,27 @@ class QuantitativeTradingAgent:
             logger.info(f"[{symbol}] regime={regime} decision=skip reason=no_mid_price")
             return
 
+        # Active position management: if position is open, trail profits, hit TP, stop loss, or exit reversals
+        if symbol in self.positions:
+            mgmt_status = await self.manage_open_position(symbol, mid_price)
+            logger.info(
+                f"[{symbol}] regime={regime} active_pos_mgmt={mgmt_status} mid={mid_price:.6g}"
+            )
+            return
+
         module = config["module"]
+
+        # Institutional frequency control: enforce 10-minute cooldown on directional entries to stop churn
+        now_ts = time.time()
+        time_since_trade = now_ts - self.last_trade_time.get(symbol, 0.0)
+        if module in ("A", "C", "D") and time_since_trade < TRADE_COOLDOWN_SECONDS:
+            rem_cd = int(TRADE_COOLDOWN_SECONDS - time_since_trade)
+            logger.info(
+                f"[{symbol}] regime={regime} module={module} mid={mid_price:.6g} "
+                f"decision=skip reason=trade_cooldown ({rem_cd}s remaining)"
+            )
+            return
+
         if module == "A":
             result = await self.execute_trend_module(symbol, mid_price)
         elif module == "B":
@@ -1053,6 +1490,46 @@ class QuantitativeTradingAgent:
         try:
             async for update in self.client.order_updates():
                 logger.info(f"Order Update Stream: {update}")
+                update_type = getattr(update, "update_type", None)
+                status = getattr(update, "status", None)
+                is_filled = (
+                    "FILLED" in str(update_type).upper()
+                    or "FILLED" in str(status).upper()
+                )
+                if is_filled:
+                    sid = getattr(update, "symbol_id", None)
+                    symbol = SYMBOL_BY_ID.get(sid, str(sid))
+                    side = str(getattr(update, "side", ""))
+                    price = float(getattr(update, "price", 0) or 0)
+                    qty = float(getattr(update, "filled_qty", 0) or getattr(update, "quantity", 0) or 0)
+                    pnl_raw = getattr(update, "realized_pnl", None)
+                    realized_pnl = float(pnl_raw) if pnl_raw is not None else None
+                    oid = getattr(update, "order_id", None)
+                    is_post_only = bool(getattr(update, "post_only", False))
+                    fee_rate = self.maker_fee_pct if is_post_only else self.taker_fee_pct
+                    fee_est = price * qty * fee_rate if price and qty else 0.0
+
+                    self.trade_logger.log_fill(
+                        symbol=symbol,
+                        side=side,
+                        fill_price=price,
+                        fill_qty=qty,
+                        realized_pnl=realized_pnl,
+                        trading_fee=fee_est,
+                        order_id=str(oid) if oid else None,
+                    )
+                    if self.telegram.enabled:
+                        msg = self.telegram.format_fill(
+                            symbol=symbol,
+                            side=side,
+                            price=price,
+                            qty=qty,
+                            realized_pnl=realized_pnl,
+                            fee=fee_est,
+                            order_id=str(oid) if oid else None,
+                        )
+                        await self.telegram.send(msg)
+
                 now = time.monotonic()
                 if now - last_sync >= SYNC_THROTTLE_SECONDS:
                     last_sync = now
@@ -1131,6 +1608,43 @@ class QuantitativeTradingAgent:
             if symbol in self.volume_history and vol > 0:
                 self.volume_history[symbol].append((time.time(), vol))
 
+    async def _fetch_tier_status(self):
+        """Query account VIP tier status to set authoritative maker/taker fee rates."""
+        try:
+            token = getattr(self.rest_client, "bearer_token", None)
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            async with httpx.AsyncClient(timeout=5.0) as http:
+                resp = await http.get(f"{REST_BASE_URL}/api/v1/tiers/status", headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    cur = data.get("current_config", {})
+                    m_bps = float(cur.get("maker_fee_bps", 1.5))
+                    t_bps = float(cur.get("taker_fee_bps", 5.5))
+                    self.maker_fee_pct = m_bps / 10000.0
+                    self.taker_fee_pct = t_bps / 10000.0
+                    t_name = data.get("tier_name", "Core")
+                    logger.info(
+                        f"Verified VIP Tier '{t_name}': Maker={self.maker_fee_pct*100:.3f}% ({m_bps} bps), "
+                        f"Taker={self.taker_fee_pct*100:.3f}% ({t_bps} bps)"
+                    )
+                    return
+                # Fallback to public tier config if user tier status endpoint is unauthenticated
+                resp_cfg = await http.get(f"{REST_BASE_URL}/api/v1/tiers/config")
+                if resp_cfg.status_code == 200:
+                    cfg_list = resp_cfg.json()
+                    if isinstance(cfg_list, list) and cfg_list:
+                        cur = cfg_list[0]
+                        m_bps = float(cur.get("maker_fee_bps", 1.5))
+                        t_bps = float(cur.get("taker_fee_bps", 5.5))
+                        self.maker_fee_pct = m_bps / 10000.0
+                        self.taker_fee_pct = t_bps / 10000.0
+                        logger.info(
+                            f"Loaded default VIP Tier schedule: Maker={self.maker_fee_pct*100:.3f}% ({m_bps} bps), "
+                            f"Taker={self.taker_fee_pct*100:.3f}% ({t_bps} bps)"
+                        )
+        except Exception as e:
+            logger.debug(f"Fee tier inquiry notice (retaining Core defaults {self.maker_fee_pct*100:.3f}%/{self.taker_fee_pct*100:.3f}%): {e}")
+
     async def run_trading_loop(self):
         swept = await self._startup_order_sweep()
 
@@ -1138,6 +1652,7 @@ class QuantitativeTradingAgent:
         for symbol in SYMBOLS:
             await self._set_leverage(symbol, DEFAULT_LEVERAGE)
 
+        await self._fetch_tier_status()
         await self.sync_positions()
         await self._seed_funding_rates()
         asyncio.create_task(self.listen_order_updates())
@@ -1250,4 +1765,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Agent process terminated manually.")
+        logger.info("Agent process terminated manually.")   

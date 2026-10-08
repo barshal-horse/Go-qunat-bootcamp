@@ -94,8 +94,15 @@ gdx-python-sdk-examples/
 | 24 | POST_ONLY_WOULD_CROSS rejections (29/5min) | Fixed by #23 - zero occurrences since |
 | 25 | MARGIN_INSUFFICIENT on Module A entries | Size cap: 80% free collateral AND portfolio-heat budget ($24k); `free_collateral` preferred over total |
 | 26 | `entered_long` logged despite rejection | `place_directional_order()` returns bool; modules return `order_rejected` on failure |
-| 27 | UnicodeEncodeError killed log records | Replaced `→` with `->` (stderr is cp1252 on Windows) |
 | 28 | No startup/failure Telegram alerts | Startup alert (with sweep count + run URL), fatal-auth alert, backoff failure alert |
+| 29 | **Taker fee drag (5.5 bps)** | Switched directional orders to `post_only=True` maker limit orders (-3.7x fees) |
+| 30 | **Micro-stops from 2s pseudo-candles** | Enforced minimum ATR floor `0.006 * price` (60 bps) to prevent micro-stops & oversizing |
+| 31 | **Negative EV from fee/funding drag** | Pre-trade gate blocks entries where friction > 25% of expected profit; fee-adjusted TP |
+| 32 | **False EMA cross signals & churn** | Added ADX >= 22, EMA separation buffer (0.10*ATR), and tighter RSI corridor (52-66 / 34-48) |
+| 33 | **Grid churn (48 orders/min)** | Added drift check (<15 bps) & dynamic ATR offsets (>=35 bps) to preserve resting orders |
+| 34 | **Rapid regime flipping** | Added regime stability hysteresis (2 consecutive cycles required to confirm transition) |
+| 35 | **No fill or realized PnL logging** | Added `log_fill()` & Telegram fill alerts with realized PnL and fee estimation |
+| 36 | **Static fee assumptions** | Added `_fetch_tier_status()` to query live VIP tier fee rates on startup |
 
 ---
 
@@ -212,19 +219,11 @@ aiohttp
 3. **Monitor attached SL/TP** - Module A entries carry SL/TP but triggers not yet observed firing
 4. **Monitor warmup time** - ~40s (20 ticks x 2s)
 
-### Known Design Gaps
-- **No exit logic for Modules A/B/D** - only Module C has a funding-normalized exit;
-  open positions rely on attached SL/TP triggers (verified as valid fields in docs,
-  firing not yet observed). Positions accumulate until heat gate blocks new entries.
-- **Regime churn** - EMA/RSI bands flip TREND <-> MEAN_REV within minutes, causing
-  grid clear/re-place cycles every 15s (36 order actions/min; well under the 1,800
-  credits/min Core-tier limit)
-- **Risk sizing distorted by 2s ticks** - ATR over 2-second pseudo-candles is tiny,
-  so `risk_budget / sl_distance` always exceeds the cap; the heat/collateral cap
-  is what actually sizes orders (~$24k notional)
-- **Hermes (Pyth) returned 401** during testing; venue mark is Pyth but no public
-  price endpoint exists - Hyperliquid allMids is the reference feed (same source
-  GoDark's UI uses for its reference book)
+### Design Gap Status
+- **Regime churn (RESOLVED by #34)**: Added regime stability hysteresis (2 cycles required before transition).
+- **Risk sizing & Micro-stops (RESOLVED by #30)**: Enforced minimum ATR floor of 0.6% price (60 bps) so that stops have realistic breathing room and sizing no longer hits the hard $24k ceiling.
+- **Taker fee drag (RESOLVED by #29 & #31)**: All entries execute as Maker via `post_only=True` with pre-trade fee drag gate and fee-adjusted TP.
+- **Hermes (Pyth) returned 401**: Venue mark is Pyth but no public price endpoint exists - Hyperliquid allMids is the reference feed (same source GoDark's UI uses for its reference book).
 
 ### Potential Issues to Watch
 - **Warmup time**: 40s minimum before first trade
