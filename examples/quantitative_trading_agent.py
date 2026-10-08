@@ -385,6 +385,47 @@ REGIME_CONFIG = {
 }
 MAX_PORTFOLIO_HEAT = 0.80
 
+# Calibrated parameters & RL dynamic quoting defaults
+GRID_OFFSETS_BPS = {
+    "SOL-USDC-PERP": [0.0025, 0.0050],  # 25 bps inner, 50 bps outer
+    "ETH-USDC-PERP": [0.0030, 0.0060],  # 30 bps inner, 60 bps outer
+    "BTC-USDC-PERP": [0.0035, 0.0070],  # 35 bps inner, 70 bps outer
+}
+INVENTORY_SKEW_GAMMA = 0.0001
+BREAKEVEN_ATR_MULT = 0.75
+TRAILING_TRIGGER_ATR_MULT = 1.25
+TRAILING_RETRACE_RATIO = 0.35
+TAKE_PROFIT_ATR_MULT = 2.2
+STOP_LOSS_ATR_MULT = 1.5
+
+# Check if external calibrated params exist and load them
+CALIBRATED_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "calibrated_params.json")
+if not os.path.exists(CALIBRATED_CONFIG_PATH):
+    CALIBRATED_CONFIG_PATH = os.path.join("config", "calibrated_params.json")
+if os.path.exists(CALIBRATED_CONFIG_PATH):
+    try:
+        with open(CALIBRATED_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cal_data = json.load(f)
+            mb = cal_data.get("module_b_grid", {})
+            if "offsets_bps" in mb:
+                GRID_OFFSETS_BPS.update(mb["offsets_bps"])
+            if "inventory_skew_gamma" in mb:
+                INVENTORY_SKEW_GAMMA = float(mb["inventory_skew_gamma"])
+            pm = cal_data.get("position_management", {})
+            if "breakeven_atr_mult" in pm:
+                BREAKEVEN_ATR_MULT = float(pm["breakeven_atr_mult"])
+            if "trailing_trigger_atr_mult" in pm:
+                TRAILING_TRIGGER_ATR_MULT = float(pm["trailing_trigger_atr_mult"])
+            if "trailing_retrace_ratio" in pm:
+                TRAILING_RETRACE_RATIO = float(pm["trailing_retrace_ratio"])
+            if "take_profit_atr_mult" in pm:
+                TAKE_PROFIT_ATR_MULT = float(pm["take_profit_atr_mult"])
+            if "stop_loss_atr_mult" in pm:
+                STOP_LOSS_ATR_MULT = float(pm["stop_loss_atr_mult"])
+            logger.info("Loaded external calibrated parameters from config/calibrated_params.json")
+    except Exception as e:
+        logger.warning(f"Could not load calibrated parameters: {e}")
+
 
 def to_sdk_side(side_str: str) -> Side:
     return Side.BUY if str(side_str).upper() == "BUY" else Side.SELL
@@ -975,9 +1016,8 @@ class QuantitativeTradingAgent:
 
         atr_pct = atr / entry
 
-        # 1. Take Profit: Lock in gains at 2.2x ATR (~1.3% - 1.8% gain)
-        # On a $100k notional position, this locks in +$1,300 to +$1,800 net cash!
-        tp_threshold = 2.2 * atr_pct
+        # 1. Take Profit: Harvest at calibrated TP threshold (e.g. 2.2x ATR)
+        tp_threshold = TAKE_PROFIT_ATR_MULT * atr_pct
         if pnl_pct >= tp_threshold:
             logger.info(
                 f"[{symbol}] [TAKE_PROFIT] TARGET HIT: PnL={pnl_pct:.2%} (+${unrealized_usd:,.2f}) "
@@ -987,9 +1027,9 @@ class QuantitativeTradingAgent:
             if closed:
                 return "harvested_profit"
 
-        # 2. Dynamic Trailing Stop / Breakeven Lock:
-        # If position gained >= 1.0x ATR and then pulls back below 0.25x ATR, exit to secure profit
-        if peak_pnl >= (1.0 * atr_pct) and pnl_pct < (0.25 * atr_pct):
+        # 2. Level 2 Dynamic Trailing Stop (High-Water Mark Retracement):
+        # Once position achieves >= TRAILING_TRIGGER_ATR_MULT (1.25x ATR), allow max 35% retrace from peak
+        if peak_pnl >= (TRAILING_TRIGGER_ATR_MULT * atr_pct) and pnl_pct < (peak_pnl * (1.0 - TRAILING_RETRACE_RATIO)):
             logger.info(
                 f"[{symbol}] [TRAILING_STOP] TRIGGERED: peak was {peak_pnl:.2%}, retraced to {pnl_pct:.2%}. "
                 f"Locking in +${unrealized_usd:,.2f} profit!"
@@ -998,8 +1038,19 @@ class QuantitativeTradingAgent:
             if closed:
                 return "trailing_stop_closed"
 
-        # 3. Protective Stop Loss: Cut loss if trade drops to -1.5x ATR
-        sl_threshold = 1.5 * atr_pct
+        # 3. Level 1 Breakeven Lock with Fee Buffer:
+        # If position gained >= BREAKEVEN_ATR_MULT (0.75x ATR) and drops back to 6 bps (+0.06%), exit to guarantee covering fees
+        if peak_pnl >= (BREAKEVEN_ATR_MULT * atr_pct) and pnl_pct <= 0.0006:
+            logger.info(
+                f"[{symbol}] [BREAKEVEN_LOCK] TRIGGERED: peak was {peak_pnl:.2%}, pulled back to {pnl_pct:.2%}. "
+                f"Exiting at fee breakeven (+${unrealized_usd:,.2f}) to preserve capital!"
+            )
+            closed = await self.close_position(symbol, reason=f"breakeven_lock_+{pnl_pct:.2%}")
+            if closed:
+                return "breakeven_closed"
+
+        # 4. Protective Stop Loss: Cut loss if trade drops to -STOP_LOSS_ATR_MULT (1.5x ATR)
+        sl_threshold = STOP_LOSS_ATR_MULT * atr_pct
         if pnl_pct <= -sl_threshold:
             logger.info(
                 f"[{symbol}] [STOP_LOSS] HIT: PnL={pnl_pct:.2%} (-${abs(unrealized_usd):,.2f}). "
@@ -1080,7 +1131,8 @@ class QuantitativeTradingAgent:
         qty = max(min_qty, MIN_NOTIONAL_USD / mid_price)
         q_str = self.format_qty(symbol, qty)
 
-        # Dynamic ATR offsets: minimum 35 bps to clear maker fee (0.03% RT) comfortably
+        # Dynamic ATR & Calibrated symbol offsets:
+        cal_offsets = GRID_OFFSETS_BPS.get(symbol, [0.0035, 0.0070])
         df = self.md_manager.get_dataframe(symbol)
         atr = mid_price * MIN_ATR_RATIO
         if len(df) >= 14:
@@ -1090,15 +1142,25 @@ class QuantitativeTradingAgent:
                 atr = max(calc_atr, mid_price * MIN_ATR_RATIO)
 
         atr_pct = atr / mid_price
-        offset_1 = max(0.0035, 0.35 * atr_pct)
-        offset_2 = offset_1 * 2.0
+        offset_1 = max(cal_offsets[0], 0.35 * atr_pct)
+        offset_2 = max(cal_offsets[1], offset_1 * 2.0)
         offsets = [offset_1, offset_2]
+
+        # Avellaneda-Stoikov Inventory Skew:
+        # Skew quoting mid-price based on net portfolio directional exposure
+        net_portfolio_delta = sum(
+            abs(p.get("notional", 0.0)) if p.get("side") == "BUY" else -abs(p.get("notional", 0.0))
+            for p in self.positions.values()
+        )
+        skew_fraction = max(-1.0, min(1.0, net_portfolio_delta / max(1.0, MAX_PORTFOLIO_NOTIONAL)))
+        skew_bps = skew_fraction * (INVENTORY_SKEW_GAMMA * 10.0)
+        skewed_mid = mid_price * (1.0 - skew_bps)
 
         new_order_ids = []
 
         for offset in offsets:
-            bid_price = mid_price * (1.0 - offset)
-            ask_price = mid_price * (1.0 + offset)
+            bid_price = skewed_mid * (1.0 - offset)
+            ask_price = skewed_mid * (1.0 + offset)
 
             bid_str = self.format_price(symbol, bid_price, rounding=ROUND_DOWN)
             ask_str = self.format_price(symbol, ask_price, rounding=ROUND_UP)

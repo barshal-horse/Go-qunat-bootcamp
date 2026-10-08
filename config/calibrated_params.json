@@ -1,0 +1,40 @@
+{
+  "version": "1.1.0",
+  "timestamp": "2026-10-08T14:17:26.167685Z",
+  "target_apr_pct": 30.0,
+  "daily_profit_target_usd": 822.0,
+  "risk_management": {
+    "risk_factor": 0.002,
+    "max_single_trade_notional": 120000.0,
+    "max_portfolio_notional": 400000.0,
+    "trade_cooldown_seconds": 600,
+    "min_atr_ratio": 0.006,
+    "max_fee_to_profit_ratio": 0.25
+  },
+  "module_b_grid": {
+    "offsets_bps": {
+      "SOL-USDC-PERP": [
+        0.0025,
+        0.005
+      ],
+      "ETH-USDC-PERP": [
+        0.003,
+        0.006
+      ],
+      "BTC-USDC-PERP": [
+        0.0035,
+        0.007
+      ]
+    },
+    "inventory_skew_gamma": 0.0001,
+    "resting_drift_tolerance": 0.0015,
+    "max_resting_age_seconds": 90.0
+  },
+  "position_management": {
+    "breakeven_atr_mult": 0.75,
+    "trailing_trigger_atr_mult": 1.25,
+    "trailing_retrace_ratio": 0.35,
+    "take_profit_atr_mult": 2.2,
+    "stop_loss_atr_mult": 1.5
+  }
+}
