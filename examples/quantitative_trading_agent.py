@@ -845,9 +845,17 @@ class QuantitativeTradingAgent:
         if not mid_price or mid_price <= 0:
             return False
 
+        # 1. Clean up any resting open orders for this symbol first so reduce-only is never blocked
+        try:
+            await self.client.cancel_all_orders(symbol)
+            self.open_grid_orders[symbol] = []
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.debug(f"[{symbol}] Cancel orders before close notice: {e}")
+
         q_str = self.format_qty(symbol, size)
 
-        # 1. Try passive Maker exit first to capture maker fees (0.015%)
+        # 2. Try passive Maker exit first to capture maker fees (0.015%)
         if side == "BUY":
             target_price = mid_price * (1.0 - MAKER_OFFSET_BPS)
             p_str = self.format_price(symbol, target_price, rounding=ROUND_DOWN)
@@ -874,9 +882,9 @@ class QuantitativeTradingAgent:
             success = getattr(ack, "success", True)
             oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
 
-            # 2. If maker post_only crossed or rejected, fallback to aggressive IOC reduce_only to guarantee capital protection
+            # 3. If maker post_only crossed or rejected, fallback to aggressive IOC reduce_only
             if not success or not oid:
-                logger.info(f"[{symbol}] Maker close would cross/rejected. Routing IOC reduce_only to guarantee execution...")
+                logger.info(f"[{symbol}] Maker close would cross/rejected. Routing IOC reduce_only...")
                 opts_ioc = PlaceOrderOptions(reduce_only=True, post_only=False, stp_mode="CANCEL_AGGRESSOR")
                 agg_price = mid_price * (1.001 if side == "BUY" else 0.999)
                 ack = await self.client.place_order(
@@ -911,10 +919,30 @@ class QuantitativeTradingAgent:
                 await asyncio.sleep(1.0)
                 await self.sync_positions()
                 return True
+
+        except OrderError as e:
+            err_msg = str(e).lower()
+            if "exceeds position" in err_msg or "increase position" in err_msg or "reduce only" in err_msg:
+                logger.info(f"[{symbol}] Reduce-only conflict ({e}). Executing exchange-native close_all({symbol})...")
+                try:
+                    await self.client.cancel_all_orders(symbol)
+                    await asyncio.sleep(0.3)
+                    close_ack = await self.client.close_all(symbol)
+                    count = getattr(close_ack, "count", 0)
+                    logger.info(f"[{symbol}] Native close_all executed successfully: count={count}")
+                    self.last_trade_time[symbol] = time.time()
+                    self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
+                    await asyncio.sleep(1.0)
+                    await self.sync_positions()
+                    return True
+                except Exception as e2:
+                    logger.error(f"[{symbol}] Native close_all failed: {e2}")
             else:
-                logger.warning(f"[{symbol}] Position close failed: {getattr(ack, 'error', None) or getattr(ack, 'error_code', None)}")
+                logger.error(f"[{symbol}] Order error during close: {e}")
+        except (GDXConnectionError, GDXTimeoutError, ConnectionError, OSError) as e:
+            logger.warning(f"[{symbol}] Transient connection drop during close ({e}). Reconnect in progress...")
         except Exception as e:
-            logger.error(f"[{symbol}] Exception executing position close: {e}", exc_info=True)
+            logger.error(f"[{symbol}] Unexpected exception executing position close: {e}", exc_info=True)
         return False
 
     async def manage_open_position(self, symbol: str, mid_price: float) -> str:
@@ -1103,6 +1131,9 @@ class QuantitativeTradingAgent:
                         )
                 except OrderError as e:
                     logger.error(f"[{symbol}] Grid Buy Error ({getattr(e, 'error_code', 'N/A')}): {e}")
+                except (GDXConnectionError, GDXTimeoutError, ConnectionError, OSError) as e:
+                    logger.warning(f"[{symbol}] Grid Buy connection notice: {e}")
+                    break
 
                 try:
                     a_ack = await self.client.place_order(
@@ -1123,6 +1154,9 @@ class QuantitativeTradingAgent:
                         )
                 except OrderError as e:
                     logger.error(f"[{symbol}] Grid Sell Error ({getattr(e, 'error_code', 'N/A')}): {e}")
+                except (GDXConnectionError, GDXTimeoutError, ConnectionError, OSError) as e:
+                    logger.warning(f"[{symbol}] Grid Sell connection notice: {e}")
+                    break
             else:
                 new_order_ids.extend(["SIM_BID_" + bid_str, "SIM_ASK_" + ask_str])
 
