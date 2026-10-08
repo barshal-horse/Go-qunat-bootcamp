@@ -40,6 +40,7 @@ jobs:
           GODARK_PASSPHRASE: ${{ secrets.GODARK_PASSPHRASE }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONUNBUFFERED: "1"
         run: |
           set -e
           timeout 340m .venv/bin/python examples/quantitative_trading_agent.py || [ $? -eq 124 ]

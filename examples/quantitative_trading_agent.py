@@ -366,9 +366,9 @@ MIN_ATR_RATIO = 0.006      # 0.6% price floor for ATR to prevent micro-stops on 
 MAX_FEE_TO_PROFIT_RATIO = 0.25  # Block trade if fees+funding exceed 25% of expected TP profit
 REGIME_STABILITY_CYCLES = 2    # Consecutive cycles needed before regime transition
 
-FUNDING_LONG_THRESHOLD = -0.0005
-FUNDING_SHORT_THRESHOLD = 0.0005
-FUNDING_EXIT_THRESHOLD = 0.0001
+FUNDING_LONG_THRESHOLD = -0.0002
+FUNDING_SHORT_THRESHOLD = 0.0002
+FUNDING_EXIT_THRESHOLD = 0.00005
 FUNDING_MAX_HOLD_HOURS = 24
 
 OI_LOOKBACK_HOURS = 4
@@ -385,11 +385,11 @@ REGIME_CONFIG = {
 }
 MAX_PORTFOLIO_HEAT = 0.80
 
-# Calibrated parameters & RL dynamic quoting defaults
+# Calibrated parameters & RL dynamic quoting defaults (Dense 3-tier inside spreads)
 GRID_OFFSETS_BPS = {
-    "SOL-USDC-PERP": [0.0025, 0.0050],  # 25 bps inner, 50 bps outer
-    "ETH-USDC-PERP": [0.0030, 0.0060],  # 30 bps inner, 60 bps outer
-    "BTC-USDC-PERP": [0.0035, 0.0070],  # 35 bps inner, 70 bps outer
+    "SOL-USDC-PERP": [0.0016, 0.0032, 0.0055],  # 16 bps, 32 bps, 55 bps
+    "ETH-USDC-PERP": [0.0018, 0.0036, 0.0060],  # 18 bps, 36 bps, 60 bps
+    "BTC-USDC-PERP": [0.0020, 0.0040, 0.0070],  # 20 bps, 40 bps, 70 bps
 }
 INVENTORY_SKEW_GAMMA = 0.0001
 BREAKEVEN_ATR_MULT = 0.75
@@ -1128,11 +1128,15 @@ class QuantitativeTradingAgent:
 
         dec = DECIMALS_MAP.get(symbol)
         min_qty = 10 ** (-(dec.quantity_decimals if dec else 3))
-        qty = max(min_qty, MIN_NOTIONAL_USD / mid_price)
+
+        # Dynamic Leg Sizing: Scale to 0.35% of collateral (~$3,500 per leg on $1M pool)
+        collateral = await self.get_collateral_balance()
+        target_leg_notional = max(1000.0, min(5000.0, collateral * 0.0035))
+        qty = max(min_qty, target_leg_notional / mid_price)
         q_str = self.format_qty(symbol, qty)
 
-        # Dynamic ATR & Calibrated symbol offsets:
-        cal_offsets = GRID_OFFSETS_BPS.get(symbol, [0.0035, 0.0070])
+        # Dynamic ATR & Dense 3-tier calibrated symbol offsets:
+        cal_offsets = GRID_OFFSETS_BPS.get(symbol, [0.0018, 0.0036, 0.0060])
         df = self.md_manager.get_dataframe(symbol)
         atr = mid_price * MIN_ATR_RATIO
         if len(df) >= 14:
@@ -1142,9 +1146,11 @@ class QuantitativeTradingAgent:
                 atr = max(calc_atr, mid_price * MIN_ATR_RATIO)
 
         atr_pct = atr / mid_price
-        offset_1 = max(cal_offsets[0], 0.35 * atr_pct)
-        offset_2 = max(cal_offsets[1], offset_1 * 2.0)
+        offset_1 = max(cal_offsets[0], 0.20 * atr_pct)
+        offset_2 = max(cal_offsets[1] if len(cal_offsets) > 1 else offset_1 * 2.0, offset_1 * 1.8)
         offsets = [offset_1, offset_2]
+        if len(cal_offsets) >= 3:
+            offsets.append(max(cal_offsets[2], offset_2 * 1.5))
 
         # Avellaneda-Stoikov Inventory Skew:
         # Skew quoting mid-price based on net portfolio directional exposure
@@ -1264,13 +1270,13 @@ class QuantitativeTradingAgent:
         adx = float(latest.get("adx", 0.0) or 0.0)
         funding = self.funding_rates.get(symbol, 0.0)
 
-        # High-Winrate Filter 1: ADX confirmation (market must be trending, not choppy)
-        if adx < 22.0:
+        # Trend Confirmation: Allow trends when ADX >= 14.0 (captures real intraday directional expansions)
+        if adx < 14.0:
             return "low_adx"
 
-        # High-Winrate Filter 2: EMA Separation Buffer (eliminates micro-touches & false crosses)
+        # EMA Separation Buffer: 0.05x ATR (eliminates micro-touches while capturing real trend legs)
         ema_spread = abs(ema_20 - ema_50)
-        if ema_spread < (0.10 * atr):
+        if ema_spread < (0.05 * atr):
             return "tight_ema_spread"
 
         bullish_cross = (prev_ema20 <= prev_ema50) and (ema_20 > ema_50)
@@ -1280,8 +1286,8 @@ class QuantitativeTradingAgent:
 
         config = REGIME_CONFIG["TREND"]
 
-        # LONG: confirmed bullish momentum, RSI corridor (52-66), no punitive funding headwind
-        if (bullish_cross or bullish_trend) and (52.0 <= rsi <= 66.0) and (funding <= 0.0004):
+        # LONG: confirmed bullish momentum, RSI corridor (45-70), no punitive funding headwind
+        if (bullish_cross or bullish_trend) and (45.0 <= rsi <= 70.0) and (funding <= 0.0004):
             if self._get_active_module_count("A") >= config["max_pos"] or not self._check_portfolio_heat():
                 return "blocked_risk"
             await self._switch_module(symbol, "A")
@@ -1292,8 +1298,8 @@ class QuantitativeTradingAgent:
             ok = await self.place_directional_order(symbol, "BUY", entry_price, qty, atr, module="A")
             return "entered_long" if ok else "order_rejected"
 
-        # SHORT: confirmed bearish momentum, RSI corridor (34-48), no punitive funding headwind
-        elif (bearish_cross or bearish_trend) and (34.0 <= rsi <= 48.0) and (funding >= -0.0004):
+        # SHORT: confirmed bearish momentum, RSI corridor (30-55), no punitive funding headwind
+        elif (bearish_cross or bearish_trend) and (30.0 <= rsi <= 55.0) and (funding >= -0.0004):
             if self._get_active_module_count("A") >= config["max_pos"] or not self._check_portfolio_heat():
                 return "blocked_risk"
             await self._switch_module(symbol, "A")
