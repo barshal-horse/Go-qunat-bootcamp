@@ -1041,17 +1041,11 @@ class QuantitativeTradingAgent:
         return f"active_{side}_pnl={pnl_pct:.2%}_(+${unrealized_usd:,.2f})"
 
     async def clear_grid_orders(self, symbol: str):
-        order_ids = self.open_grid_orders.get(symbol, [])
-        if not order_ids:
-            return
-
-        logger.info(f"[{symbol}] Clearing {len(order_ids)} stale Module B grid orders...")
         if not DRY_RUN:
-            for oid in order_ids:
-                try:
-                    await self.client.cancel_order(str(oid), symbol)
-                except Exception as e:
-                    logger.debug(f"[{symbol}] Error cancelling order {oid}: {e}")
+            try:
+                await self.client.cancel_all_orders(symbol)
+            except Exception as e:
+                logger.debug(f"[{symbol}] Error cancelling grid orders: {e}")
         self.open_grid_orders[symbol] = []
 
     async def execute_grid_module(self, symbol: str, mid_price: float):
