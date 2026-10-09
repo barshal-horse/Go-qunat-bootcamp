@@ -756,6 +756,9 @@ class QuantitativeTradingAgent:
         return max(final_qty, min_qty)
 
     async def _set_leverage(self, symbol: str, leverage: int) -> bool:
+        if DRY_RUN:
+            logger.debug(f"[{symbol}] DRY_RUN enabled, skipping update_leverage.")
+            return True
         try:
             ack = await self.client.update_leverage(symbol, leverage)
             success = getattr(ack, "success", True)
@@ -770,6 +773,9 @@ class QuantitativeTradingAgent:
 
     async def _startup_order_sweep(self) -> int:
         """Cancel every resting order left behind by a previous run."""
+        if DRY_RUN:
+            logger.info("Startup sweep: DRY_RUN enabled, preserving active exchange orders.")
+            return 0
         try:
             ack = await self.client.cancel_all_orders()
             count = getattr(ack, "count", 0) or 0
@@ -2126,13 +2132,16 @@ class QuantitativeTradingAgent:
         self.running = False
         for symbol in SYMBOLS:
             await self.clear_grid_orders(symbol)
-        try:
-            ack = await self.client.cancel_all_orders()
-            count = getattr(ack, "count", 0) or 0
-            if count:
-                logger.info(f"Shutdown sweep: cancelled {count} resting order(s).")
-        except Exception as e:
-            logger.warning(f"Shutdown order sweep failed: {e}")
+        if DRY_RUN:
+            logger.info("Shutdown sweep: DRY_RUN enabled, preserving active exchange orders.")
+        else:
+            try:
+                ack = await self.client.cancel_all_orders()
+                count = getattr(ack, "count", 0) or 0
+                if count:
+                    logger.info(f"Shutdown sweep: cancelled {count} resting order(s).")
+            except Exception as e:
+                logger.warning(f"Shutdown order sweep failed: {e}")
         if self.md_client:
             await self.md_client.disconnect()
 
