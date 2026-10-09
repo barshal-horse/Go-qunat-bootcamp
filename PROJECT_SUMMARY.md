@@ -25,25 +25,31 @@
 
 ---
 
-## Module Specifications
+## Module Specifications (Senior Quant Architecture)
 
 | Module | Strategy | Weight | Leverage | Max Pos | Trigger |
 |--------|----------|--------|----------|---------|---------|
-| **A - Trend** | EMA20×EMA50 cross + RSI 50-65/35-50 | 45% | 3x | 2 | ADX > 25 |
-| **B - Grid/MR** | BB mean-reversion + ADX < 20 | 25% | 2x | 3 | ADX < 20 or price in BB |
-| **C - Funding** | Funding ≤ -0.05% (LONG) / ≥ +0.05% (SHORT) | 15% | 2x | 2 | \|Funding\| > 0.05% |
-| **D - Breakout** | Keltner breakout + OI surge >20% + vol > 1.5x | 15% | 3x | 1 | Keltner break + OI surge |
+| **C - Funding Carry** | Hourly Funding Harvesting (Longs pay Shorts: SELL / Shorts pay Longs: BUY) | 50% | 2x | 2 | \|Funding\| ≥ 0.010%/hr (10 bps) |
+| **E - Stat-Arb** | Delta-Neutral Cointegrated Pairs (ETH/BTC Ratio 60-period rolling Z-score) | 30% | 2x | 2 | \|Z\| ≥ 1.75 (Exit \|Z\| ≤ 0.30) |
+| **B - Dense MM** | 3-Tier Dense Inside Quoting + Instant Counter Round-Turn Exit | 20% | 2x | 3 | Inside spreads (16-20 bps) |
+| **A - Trend** | (Deprecated naked directional bets to prevent fee drag and drawdown) | 0% | 2x | 0 | Inactive |
+| **D - Breakout** | (Deprecated to focus capital on structural carry and stat-arb edge) | 0% | 2x | 0 | Inactive |
 
 ---
 
 ## Current Architecture Flow
 
 ```
-evaluate_symbol() → _detect_regime() → Route to Module A/B/C/D
+run_trading_loop()
      ↓
-place_directional_order() / execute_grid_module()
+1. evaluate_stat_arb_pair()  → ETH/BTC Cointegrated Delta-Neutral Legs ($30k each)
      ↓
-TradeLogger.log_trade() / log_grid() + TelegramNotifier
+2. evaluate_symbol()         → Priority 1: Module C Funding Carry ($70k notional)
+                             → Priority 2: Module B Dense MM with Instant Round-Turn Exit
+     ↓
+place_directional_order() / execute_grid_module() [Strict Maker post_only=True]
+     ↓
+TradeLogger.log_trade() / log_grid() / log_fill() + TelegramNotifier
 ```
 
 ---

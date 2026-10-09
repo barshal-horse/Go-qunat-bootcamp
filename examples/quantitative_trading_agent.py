@@ -20,6 +20,7 @@ from datetime import datetime
 
 import httpx
 import pandas as pd
+import numpy as np
 
 try:
     from dotenv import load_dotenv
@@ -366,10 +367,23 @@ MIN_ATR_RATIO = 0.006      # 0.6% price floor for ATR to prevent micro-stops on 
 MAX_FEE_TO_PROFIT_RATIO = 0.25  # Block trade if fees+funding exceed 25% of expected TP profit
 REGIME_STABILITY_CYCLES = 2    # Consecutive cycles needed before regime transition
 
-FUNDING_LONG_THRESHOLD = -0.0002
-FUNDING_SHORT_THRESHOLD = 0.0002
-FUNDING_EXIT_THRESHOLD = 0.00005
+# Module C: Funding Carry Arbitrage (Primary Structural Yield Engine)
+FUNDING_ENTRY_THRESHOLD = 0.00010   # 10 bps/hr (~87.6% APR) threshold to enter carry trade
+FUNDING_LONG_THRESHOLD = -0.00010   # Shorts pay longs: enter LONG
+FUNDING_SHORT_THRESHOLD = 0.00010   # Longs pay shorts: enter SHORT
+FUNDING_EXIT_THRESHOLD = 0.00003    # 3 bps/hr threshold to exit when carry normalizes
 FUNDING_MAX_HOLD_HOURS = 24
+TARGET_CARRY_NOTIONAL = 70000.0     # Target $70k notional per carry asset ($140k total on 2 assets = 0.14x leverage)
+
+# Module E: Delta-Neutral Cointegrated Stat-Arb (ETH/BTC Pair Engine)
+STAT_ARB_ENTRY_Z = 1.75             # Enter pair when ratio diverged >= 1.75 standard deviations
+STAT_ARB_EXIT_Z = 0.30              # Exit pair when ratio mean-reverts to within 0.30 std devs
+STAT_ARB_STOP_Z = 3.20              # Divergence stop-loss threshold
+STAT_ARB_NOTIONAL = 30000.0         # $30k per leg ($60k total pair notional = 0.06x leverage)
+STAT_ARB_LOOKBACK = 60              # 60 rolling ticks/periods for z-score calculation
+
+# Module B: Dense Maker Market Making with Instant Round-Turn
+MM_ROUND_TURN_SPREAD_BPS = 0.0020   # 20 bps target for instant market-making round-turn
 
 OI_LOOKBACK_HOURS = 4
 OI_SURGE_THRESHOLD = 0.20
@@ -378,10 +392,11 @@ KELTNER_PERIOD = 20
 KELTNER_ATR_MULT = 2.0
 
 REGIME_CONFIG = {
-    "TREND":       {"module": "A", "weight": 0.45, "leverage": 3, "max_pos": 2},
-    "MEAN_REV":    {"module": "B", "weight": 0.25, "leverage": 2, "max_pos": 3},
-    "FUNDING":     {"module": "C", "weight": 0.15, "leverage": 2, "max_pos": 2},
-    "BREAKOUT":    {"module": "D", "weight": 0.15, "leverage": 3, "max_pos": 1},
+    "FUNDING":     {"module": "C", "weight": 0.50, "leverage": 2, "max_pos": 2},
+    "STAT_ARB":    {"module": "E", "weight": 0.30, "leverage": 2, "max_pos": 2},
+    "MEAN_REV":    {"module": "B", "weight": 0.20, "leverage": 2, "max_pos": 3},
+    "TREND":       {"module": "A", "weight": 0.00, "leverage": 2, "max_pos": 0},
+    "BREAKOUT":    {"module": "D", "weight": 0.00, "leverage": 2, "max_pos": 0},
 }
 MAX_PORTFOLIO_HEAT = 0.80
 
@@ -411,6 +426,28 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 GRID_OFFSETS_BPS.update(mb["offsets_bps"])
             if "inventory_skew_gamma" in mb:
                 INVENTORY_SKEW_GAMMA = float(mb["inventory_skew_gamma"])
+            if "round_turn_spread_bps" in mb:
+                MM_ROUND_TURN_SPREAD_BPS = float(mb["round_turn_spread_bps"])
+            mc = cal_data.get("module_c_funding", {})
+            if "funding_entry_threshold" in mc:
+                FUNDING_ENTRY_THRESHOLD = float(mc["funding_entry_threshold"])
+                FUNDING_SHORT_THRESHOLD = FUNDING_ENTRY_THRESHOLD
+                FUNDING_LONG_THRESHOLD = -FUNDING_ENTRY_THRESHOLD
+            if "funding_exit_threshold" in mc:
+                FUNDING_EXIT_THRESHOLD = float(mc["funding_exit_threshold"])
+            if "target_carry_notional" in mc:
+                TARGET_CARRY_NOTIONAL = float(mc["target_carry_notional"])
+            me = cal_data.get("module_e_stat_arb", {})
+            if "entry_z_score" in me:
+                STAT_ARB_ENTRY_Z = float(me["entry_z_score"])
+            if "exit_z_score" in me:
+                STAT_ARB_EXIT_Z = float(me["exit_z_score"])
+            if "stop_loss_z_score" in me:
+                STAT_ARB_STOP_Z = float(me["stop_loss_z_score"])
+            if "notional_per_leg" in me:
+                STAT_ARB_NOTIONAL = float(me["notional_per_leg"])
+            if "lookback_periods" in me:
+                STAT_ARB_LOOKBACK = int(me["lookback_periods"])
             pm = cal_data.get("position_management", {})
             if "breakeven_atr_mult" in pm:
                 BREAKEVEN_ATR_MULT = float(pm["breakeven_atr_mult"])
@@ -561,6 +598,12 @@ class QuantitativeTradingAgent:
         self.cached_collateral: float = 1000000.0
         self.last_trade_time: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
         self.position_peak_pnl: Dict[str, float] = {}
+
+        # Delta-Neutral Stat-Arb state (ETH/BTC Pair Engine)
+        self.eth_btc_ratios: Deque[Tuple[float, float]] = deque(maxlen=STAT_ARB_LOOKBACK * 2)
+        self.stat_arb_active: Optional[str] = None  # None, "LONG_ETH_SHORT_BTC", "SHORT_ETH_LONG_BTC"
+        self.stat_arb_entry_z: float = 0.0
+        self.position_source_module: Dict[str, str] = {}  # Tracks originating module for each position (e.g. "B", "C", "E")
 
     # -------------------------------------------------------------------------
     # Formatting Helpers
@@ -753,8 +796,16 @@ class QuantitativeTradingAgent:
         # Fee & Funding Pre-Trade Gate:
         expected_profit = abs(tp - price) * qty
         expected_fees = (price * qty) * (self.maker_fee_pct * 2.0)
-        expected_funding = (price * qty) * abs(self.funding_rates.get(symbol, 0.0)) * 2.0
-        total_friction = expected_fees + expected_funding
+
+        # Funding rate cash flow: if position collects funding or is Carry/Stat-Arb, funding is yield (NOT friction!)
+        funding_rate = self.funding_rates.get(symbol, 0.0)
+        is_earning_funding = (side == "SELL" and funding_rate > 0) or (side == "BUY" and funding_rate < 0)
+        if is_earning_funding or module in ("C", "E"):
+            expected_funding_cost = 0.0
+        else:
+            expected_funding_cost = (price * qty) * abs(funding_rate) * 2.0
+
+        total_friction = expected_fees + expected_funding_cost
         if expected_profit > 0 and (total_friction / expected_profit) > MAX_FEE_TO_PROFIT_RATIO:
             logger.info(
                 f"[{symbol}] MODULE {module} trade blocked: total friction ${total_friction:.2f} "
@@ -790,6 +841,7 @@ class QuantitativeTradingAgent:
         if DRY_RUN:
             logger.info(f"[{symbol}] DRY_RUN enabled. Order execution simulated.")
             order_id = "DRY_RUN_" + str(int(time.time()))
+            self.position_source_module[symbol] = module
             regime = self._detect_regime(symbol)
             self.trade_logger.log_trade(
                 symbol=symbol, side=side, price=price, qty=qty,
@@ -850,6 +902,7 @@ class QuantitativeTradingAgent:
 
             logger.info(f"[{symbol}] Order successfully accepted: order_id={order_id}")
             self.last_trade_time[symbol] = time.time()
+            self.position_source_module[symbol] = module
             regime = self._detect_regime(symbol)
 
             self.trade_logger.log_trade(
@@ -910,6 +963,14 @@ class QuantitativeTradingAgent:
             f"[{symbol}] Routing position close: {side} {q_str} (closing {pos_side} position) | price={p_str} | reason='{reason}'"
         )
 
+        if DRY_RUN:
+            logger.info(f"[{symbol}] DRY_RUN enabled. Position close simulated (reason='{reason}').")
+            self.last_trade_time[symbol] = time.time()
+            self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
+            self.position_source_module.pop(symbol, None)
+            self.positions.pop(symbol, None)
+            return True
+
         try:
             ack = await self.client.place_order(
                 symbol=symbol,
@@ -944,6 +1005,7 @@ class QuantitativeTradingAgent:
                 logger.info(f"[{symbol}] Position closed successfully: order_id={oid} reason='{reason}'")
                 self.last_trade_time[symbol] = time.time()
                 self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
+                self.position_source_module.pop(symbol, None)
                 if self.telegram.enabled:
                     entry = float(pos.get("entry_price", mid_price))
                     pnl_pct = (mid_price - entry) / entry if pos["size"] > 0 else (entry - mid_price) / entry
@@ -973,6 +1035,7 @@ class QuantitativeTradingAgent:
                     logger.info(f"[{symbol}] Native close_all executed successfully: count={count}")
                     self.last_trade_time[symbol] = time.time()
                     self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
+                    self.position_source_module.pop(symbol, None)
                     await asyncio.sleep(1.0)
                     await self.sync_positions()
                     return True
@@ -1015,6 +1078,32 @@ class QuantitativeTradingAgent:
         peak_pnl = self.position_peak_pnl[peak_key]
 
         atr_pct = atr / entry
+        source_module = self.position_source_module.get(symbol, self.active_modules.get(symbol, "B"))
+
+        # 0. Market Making (Module B) Fast Round-Turn Exit:
+        # If position originated from MM grid quoting, take profit at MM_ROUND_TURN_SPREAD_BPS (+20 bps)
+        # to immediately capture maker spread and neutralize inventory back to zero.
+        if source_module == "B" or (entry * size) < 10000.0:
+            if pnl_pct >= MM_ROUND_TURN_SPREAD_BPS:
+                logger.info(
+                    f"[{symbol}] [MM_ROUND_TURN] Target +{pnl_pct:.2%} hit (+${unrealized_usd:,.2f}). "
+                    f"Locking in market making spread profit!"
+                )
+                closed = await self.close_position(symbol, reason=f"mm_round_turn_+{pnl_pct:.2%}")
+                if closed:
+                    return "mm_round_turn_closed"
+
+        # 0B. Funding Carry (Module C) Normalization Exit:
+        funding = self.funding_rates.get(symbol, 0.0)
+        if source_module == "C":
+            if abs(funding) < FUNDING_EXIT_THRESHOLD:
+                logger.info(
+                    f"[{symbol}] [CARRY_HARVEST] Funding normalized ({funding:.6f} < {FUNDING_EXIT_THRESHOLD:.6f}). "
+                    f"Harvesting carry (+${unrealized_usd:,.2f})..."
+                )
+                closed = await self.close_position(symbol, reason=f"funding_normalized_{funding:.6f}")
+                if closed:
+                    return "carry_normalized_closed"
 
         # 1. Take Profit: Harvest at calibrated TP threshold (e.g. 2.2x ATR)
         tp_threshold = TAKE_PROFIT_ATR_MULT * atr_pct
@@ -1078,12 +1167,12 @@ class QuantitativeTradingAgent:
 
         # 5. Funding Headwind Invalidation (Carry Protection)
         funding = self.funding_rates.get(symbol, 0.0)
-        if side == "SELL" and funding < -0.0003:
+        if side == "SELL" and funding < -0.00010:
             logger.info(f"[{symbol}] Funding turned punitive ({funding:.6f}) against SHORT. Closing carry...")
             closed = await self.close_position(symbol, reason="funding_flip_exit")
             if closed:
                 return "funding_flip_closed"
-        elif side == "BUY" and funding > 0.0003:
+        elif side == "BUY" and funding > 0.00010:
             logger.info(f"[{symbol}] Funding turned punitive ({funding:.6f}) against LONG. Closing carry...")
             closed = await self.close_position(symbol, reason="funding_flip_exit")
             if closed:
@@ -1320,40 +1409,54 @@ class QuantitativeTradingAgent:
 
         df = TechnicalIndicators.calculate_indicators(df)
         latest = df.iloc[-1]
-        rsi = float(latest["rsi"]) if not pd.isna(latest["rsi"]) else 50.0
-        atr = float(latest["atr"]) if not pd.isna(latest["atr"]) else mid_price * 0.002
+        calc_atr = float(latest.get("atr", 0.0) or 0.0)
+        atr = max(calc_atr, mid_price * MIN_ATR_RATIO)
 
         # Exit condition: harvest profit once funding normalizes
         if symbol in self.positions:
             pos = self.positions[symbol]
             if abs(funding) < FUNDING_EXIT_THRESHOLD:
-                logger.info(f"[{symbol}] Module C funding normalized ({funding:.6f}). Closing position...")
-                close_side = "SELL" if pos["size"] > 0 else "BUY"
-                ok = await self.place_directional_order(symbol, close_side, mid_price, abs(pos["size"]), atr, module="C_EXIT")
-                return "exit_placed" if ok else "order_rejected"
+                logger.info(f"[{symbol}] Module C funding normalized ({funding:.6f} < {FUNDING_EXIT_THRESHOLD:.6f}). Closing position...")
+                closed = await self.close_position(symbol, reason=f"funding_normalized_{funding:.6f}")
+                return "exit_placed" if closed else "order_rejected"
             return "already_positioned"
 
         config = REGIME_CONFIG["FUNDING"]
+        if self._get_active_module_count("C") >= config["max_pos"] or not self._check_portfolio_heat():
+            return "blocked_risk"
 
-        if funding <= FUNDING_LONG_THRESHOLD and rsi < 65:
-            if self._get_active_module_count("C") >= config["max_pos"] or not self._check_portfolio_heat():
-                return "blocked_risk"
+        collateral = await self.get_collateral_balance()
+        current_notional = sum(abs(p.get("notional", 0.0)) for p in self.positions.values())
+        remaining_heat = max(0.0, MAX_PORTFOLIO_NOTIONAL - current_notional)
+        target_notional = min(TARGET_CARRY_NOTIONAL, MAX_SINGLE_TRADE_NOTIONAL, remaining_heat, collateral * 0.10)
+        qty = target_notional / mid_price
+        dec = DECIMALS_MAP.get(symbol)
+        min_qty = 10 ** (-(dec.quantity_decimals if dec else 3))
+        qty = max(min_qty, qty)
+
+        # 1. Longs pay shorts (funding >= +10 bps/hr): enter SHORT carry position to harvest payments
+        if funding >= FUNDING_SHORT_THRESHOLD:
             await self._switch_module(symbol, "C")
             await self._set_leverage(symbol, config["leverage"])
-            qty = await self.calculate_risk_position_size(symbol, mid_price, atr)
-            ok = await self.place_directional_order(symbol, "BUY", mid_price, qty, atr, module="C")
-            logger.info(f"[{symbol}] Module C LONG: funding={funding:.6f}, RSI={rsi:.1f}")
-            return "entered_long" if ok else "order_rejected"
-
-        elif funding >= FUNDING_SHORT_THRESHOLD and rsi > 35:
-            if self._get_active_module_count("C") >= config["max_pos"] or not self._check_portfolio_heat():
-                return "blocked_risk"
-            await self._switch_module(symbol, "C")
-            await self._set_leverage(symbol, config["leverage"])
-            qty = await self.calculate_risk_position_size(symbol, mid_price, atr)
-            ok = await self.place_directional_order(symbol, "SELL", mid_price, qty, atr, module="C")
-            logger.info(f"[{symbol}] Module C SHORT: funding={funding:.6f}, RSI={rsi:.1f}")
+            entry_price = mid_price * (1.0 + MAKER_OFFSET_BPS)
+            ok = await self.place_directional_order(symbol, "SELL", entry_price, qty, atr, module="C")
+            logger.info(
+                f"[{symbol}] Module C (Funding Carry) SHORT entered: funding={funding:.6f} "
+                f"(+{funding*10000:.1f} bps/hr), notional=${target_notional:,.2f}"
+            )
             return "entered_short" if ok else "order_rejected"
+
+        # 2. Shorts pay longs (funding <= -10 bps/hr): enter LONG carry position to harvest payments
+        elif funding <= FUNDING_LONG_THRESHOLD:
+            await self._switch_module(symbol, "C")
+            await self._set_leverage(symbol, config["leverage"])
+            entry_price = mid_price * (1.0 - MAKER_OFFSET_BPS)
+            ok = await self.place_directional_order(symbol, "BUY", entry_price, qty, atr, module="C")
+            logger.info(
+                f"[{symbol}] Module C (Funding Carry) LONG entered: funding={funding:.6f} "
+                f"({funding*10000:.1f} bps/hr), notional=${target_notional:,.2f}"
+            )
+            return "entered_long" if ok else "order_rejected"
 
         return "no_signal"
 
@@ -1402,6 +1505,142 @@ class QuantitativeTradingAgent:
         return "no_signal"
 
     # -------------------------------------------------------------------------
+    # Module E: Cointegrated Delta-Neutral Stat-Arb & MM Instant Round-Turn
+    # -------------------------------------------------------------------------
+    async def _handle_instant_round_turn(self, symbol: str, fill_side: str, fill_price: float, fill_qty: float):
+        """Immediately place counter Maker limit order upon grid fill to complete the round-turn."""
+        if fill_price <= 0 or fill_qty <= 0:
+            return
+        try:
+            counter_side = "SELL" if "BUY" in fill_side.upper() else "BUY"
+            spread_offset = MM_ROUND_TURN_SPREAD_BPS
+            target_price = fill_price * (1.0 + spread_offset) if counter_side == "SELL" else fill_price * (1.0 - spread_offset)
+
+            p_str = self.format_price(symbol, target_price, rounding=ROUND_UP if counter_side == "SELL" else ROUND_DOWN)
+            q_str = self.format_qty(symbol, fill_qty)
+
+            opts = PlaceOrderOptions(reduce_only=True, post_only=True, stp_mode="CANCEL_AGGRESSOR")
+            logger.info(
+                f"[{symbol}] [MM_ROUND_TURN] Posting counter Maker {counter_side} {q_str} @ {p_str} "
+                f"(+{spread_offset*10000:.1f} bps above fill {fill_price:.6g}) to lock in spread..."
+            )
+            if DRY_RUN:
+                logger.info(f"[{symbol}] [MM_ROUND_TURN] DRY_RUN enabled. Counter order simulated.")
+                return
+
+            ack = await self.client.place_order(
+                symbol=symbol,
+                side=to_sdk_side(counter_side),
+                order_type=OrderType.LIMIT,
+                quantity=q_str,
+                price=p_str,
+                time_in_force=TimeInForce.GTC,
+                options=opts,
+            )
+            if getattr(ack, "success", True):
+                logger.info(f"[{symbol}] [MM_ROUND_TURN] Counter order placed successfully.")
+            else:
+                logger.warning(f"[{symbol}] [MM_ROUND_TURN] Counter order placement notice: {getattr(ack, 'error', None)}")
+        except Exception as e:
+            logger.debug(f"[{symbol}] Round-turn order notice: {e}")
+
+    async def evaluate_stat_arb_pair(self):
+        """Delta-Neutral Statistical Arbitrage between ETH-USDC-PERP and BTC-USDC-PERP."""
+        eth_sym = "ETH-USDC-PERP"
+        btc_sym = "BTC-USDC-PERP"
+        eth_mid = self.md_manager.current_mids.get(eth_sym, 0.0)
+        btc_mid = self.md_manager.current_mids.get(btc_sym, 0.0)
+
+        if eth_mid <= 0 or btc_mid <= 0:
+            return
+
+        ratio = eth_mid / btc_mid
+        now_ts = time.time()
+        self.eth_btc_ratios.append((now_ts, ratio))
+
+        if len(self.eth_btc_ratios) < 20:
+            return
+
+        ratios = [r for _, r in self.eth_btc_ratios]
+        mean_r = float(np.mean(ratios))
+        std_r = float(np.std(ratios))
+        if std_r <= 1e-8:
+            return
+
+        z_score = (ratio - mean_r) / std_r
+
+        # Active Pair Management
+        if self.stat_arb_active:
+            # Mean Reversion Target
+            if (self.stat_arb_active == "LONG_ETH_SHORT_BTC" and z_score >= -STAT_ARB_EXIT_Z) or \
+               (self.stat_arb_active == "SHORT_ETH_LONG_BTC" and z_score <= STAT_ARB_EXIT_Z):
+                logger.info(
+                    f"[STAT_ARB] Mean-reversion target reached (z={z_score:.2f}, entry_z={self.stat_arb_entry_z:.2f}). "
+                    f"Closing ETH/BTC pair..."
+                )
+                await self.close_position(eth_sym, reason=f"stat_arb_mean_revert_z_{z_score:.2f}")
+                await self.close_position(btc_sym, reason=f"stat_arb_mean_revert_z_{z_score:.2f}")
+                self.stat_arb_active = None
+                return
+
+            # Divergence Stop Loss
+            if abs(z_score) >= STAT_ARB_STOP_Z:
+                logger.warning(
+                    f"[STAT_ARB] Divergence stop hit (z={z_score:.2f}). Closing pair to protect capital..."
+                )
+                await self.close_position(eth_sym, reason=f"stat_arb_stop_loss_z_{z_score:.2f}")
+                await self.close_position(btc_sym, reason=f"stat_arb_stop_loss_z_{z_score:.2f}")
+                self.stat_arb_active = None
+                return
+
+            return
+
+        # New Pair Entry Evaluation
+        if eth_sym in self.positions or btc_sym in self.positions:
+            return
+        if not self._check_portfolio_heat():
+            return
+
+        collateral = await self.get_collateral_balance()
+        leg_notional = min(STAT_ARB_NOTIONAL, collateral * 0.05, MAX_SINGLE_TRADE_NOTIONAL / 2.0)
+        eth_qty = leg_notional / eth_mid
+        btc_qty = leg_notional / btc_mid
+
+        # Case 1: ETH is underpriced relative to BTC (z <= -STAT_ARB_ENTRY_Z)
+        if z_score <= -STAT_ARB_ENTRY_Z:
+            logger.info(
+                f"[STAT_ARB] Signal: LONG ETH / SHORT BTC (z={z_score:.2f}, ratio={ratio:.6f}, leg=${leg_notional:,.0f})"
+            )
+            await self._switch_module(eth_sym, "E")
+            await self._switch_module(btc_sym, "E")
+            await self._set_leverage(eth_sym, 2)
+            await self._set_leverage(btc_sym, 2)
+
+            ok_eth = await self.place_directional_order(eth_sym, "BUY", eth_mid, eth_qty, eth_mid * 0.005, module="E")
+            ok_btc = await self.place_directional_order(btc_sym, "SELL", btc_mid, btc_qty, btc_mid * 0.005, module="E")
+
+            if ok_eth and ok_btc:
+                self.stat_arb_active = "LONG_ETH_SHORT_BTC"
+                self.stat_arb_entry_z = z_score
+
+        # Case 2: ETH is overpriced relative to BTC (z >= STAT_ARB_ENTRY_Z)
+        elif z_score >= STAT_ARB_ENTRY_Z:
+            logger.info(
+                f"[STAT_ARB] Signal: SHORT ETH / LONG BTC (z={z_score:.2f}, ratio={ratio:.6f}, leg=${leg_notional:,.0f})"
+            )
+            await self._switch_module(eth_sym, "E")
+            await self._switch_module(btc_sym, "E")
+            await self._set_leverage(eth_sym, 2)
+            await self._set_leverage(btc_sym, 2)
+
+            ok_eth = await self.place_directional_order(eth_sym, "SELL", eth_mid, eth_qty, eth_mid * 0.005, module="E")
+            ok_btc = await self.place_directional_order(btc_sym, "BUY", btc_mid, btc_qty, btc_mid * 0.005, module="E")
+
+            if ok_eth and ok_btc:
+                self.stat_arb_active = "SHORT_ETH_LONG_BTC"
+                self.stat_arb_entry_z = z_score
+
+    # -------------------------------------------------------------------------
     # Regime Switching & Feeders
     # -------------------------------------------------------------------------
     def _get_oi_change(self, symbol: str, hours: int = OI_LOOKBACK_HOURS) -> float:
@@ -1446,14 +1685,15 @@ class QuantitativeTradingAgent:
         bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid > 0 else 0.0
 
         funding = abs(self.funding_rates.get(symbol, 0.0))
-        oi_change = self._get_oi_change(symbol)
 
+        # Institutional Regime Priority:
+        # 1. High Funding Yield (> 10 bps/hr): Prioritize Carry Harvesting (Risk-Free Cash Yield)
         if funding >= FUNDING_SHORT_THRESHOLD:
             raw_regime = "FUNDING"
-        elif adx > 25:
-            raw_regime = "TREND"
-        elif oi_change > OI_SURGE_THRESHOLD or self._volume_surge(symbol):
-            raw_regime = "BREAKOUT"
+        # 2. Cointegrated Delta-Neutral Stat-Arb pair active
+        elif symbol in ("ETH-USDC-PERP", "BTC-USDC-PERP") and self.stat_arb_active:
+            raw_regime = "STAT_ARB"
+        # 3. Dense Market Making with Instant Round-Turn Spread Harvesting
         else:
             raw_regime = "MEAN_REV"
 
@@ -1648,6 +1888,11 @@ class QuantitativeTradingAgent:
                         )
                         await self.telegram.send(msg)
 
+                    # Trigger instant round-turn counter order if fill was for Market Making lot
+                    mod = self.position_source_module.get(symbol, self.active_modules.get(symbol, "B"))
+                    if mod == "B" and price > 0 and qty > 0:
+                        asyncio.create_task(self._handle_instant_round_turn(symbol, side, price, qty))
+
                 now = time.monotonic()
                 if now - last_sync >= SYNC_THROTTLE_SECONDS:
                     last_sync = now
@@ -1788,6 +2033,13 @@ class QuantitativeTradingAgent:
                     logger.debug(f"Position sync notice: {e}")
 
                 if self.system_health_accepting:
+                    # 1. Delta-Neutral Cointegrated Stat-Arb Pair (ETH/BTC)
+                    try:
+                        await self.evaluate_stat_arb_pair()
+                    except Exception as e:
+                        logger.error(f"Stat-Arb Execution Error: {e}", exc_info=True)
+
+                    # 2. Individual Symbol Execution (Funding Carry & Dense MM)
                     for symbol in SYMBOLS:
                         try:
                             await self.evaluate_symbol(symbol)
