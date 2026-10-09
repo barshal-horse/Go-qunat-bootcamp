@@ -972,34 +972,54 @@ class QuantitativeTradingAgent:
             return True
 
         try:
-            ack = await self.client.place_order(
-                symbol=symbol,
-                side=to_sdk_side(side),
-                order_type=OrderType.LIMIT,
-                quantity=q_str,
-                price=p_str,
-                time_in_force=TimeInForce.GTC,
-                options=opts_maker,
-            )
-            success = getattr(ack, "success", True)
-            oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
-
-            # 3. If maker post_only crossed or rejected, fallback to aggressive IOC reduce_only
-            if not success or not oid:
-                logger.info(f"[{symbol}] Maker close would cross/rejected. Routing IOC reduce_only...")
-                opts_ioc = PlaceOrderOptions(reduce_only=True, post_only=False, stp_mode="CANCEL_AGGRESSOR")
-                agg_price = mid_price * (1.001 if side == "BUY" else 0.999)
+            # 2. Try passive Maker exit first to capture maker fees (0.015%)
+            try:
                 ack = await self.client.place_order(
                     symbol=symbol,
                     side=to_sdk_side(side),
                     order_type=OrderType.LIMIT,
                     quantity=q_str,
-                    price=self.format_price(symbol, agg_price),
-                    time_in_force=TimeInForce.IOC,
-                    options=opts_ioc,
+                    price=p_str,
+                    time_in_force=TimeInForce.GTC,
+                    options=opts_maker,
                 )
                 success = getattr(ack, "success", True)
                 oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
+            except OrderError as e:
+                logger.info(f"[{symbol}] Maker close rejected/crossed ({e}). Routing IOC reduce_only...")
+                success = False
+                oid = None
+
+            # 3. If maker post_only crossed or rejected, fallback to aggressive IOC reduce_only
+            if not success or not oid:
+                try:
+                    logger.info(f"[{symbol}] Routing IOC reduce_only...")
+                    opts_ioc = PlaceOrderOptions(reduce_only=True, post_only=False, stp_mode="CANCEL_AGGRESSOR")
+                    agg_price = mid_price * (1.002 if side == "BUY" else 0.998)
+                    ack = await self.client.place_order(
+                        symbol=symbol,
+                        side=to_sdk_side(side),
+                        order_type=OrderType.LIMIT,
+                        quantity=q_str,
+                        price=self.format_price(symbol, agg_price),
+                        time_in_force=TimeInForce.IOC,
+                        options=opts_ioc,
+                    )
+                    success = getattr(ack, "success", True)
+                    oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
+                except OrderError as e:
+                    logger.info(f"[{symbol}] IOC reduce_only rejected ({e}). Executing exchange-native close_all...")
+                    success = False
+                    oid = None
+
+            # 4. If neither Maker nor IOC filled, execute exchange-native close_all
+            if not success or not oid:
+                logger.info(f"[{symbol}] Fallback to exchange-native close_all({symbol})...")
+                await self.client.cancel_all_orders(symbol)
+                await asyncio.sleep(0.3)
+                close_ack = await self.client.close_all(symbol)
+                success = True
+                oid = getattr(close_ack, "count", 1) or "NATIVE_CLOSE_ALL"
 
             if success and oid:
                 logger.info(f"[{symbol}] Position closed successfully: order_id={oid} reason='{reason}'")
@@ -1024,25 +1044,21 @@ class QuantitativeTradingAgent:
                 return True
 
         except OrderError as e:
-            err_msg = str(e).lower()
-            if "exceeds position" in err_msg or "increase position" in err_msg or "reduce only" in err_msg:
-                logger.info(f"[{symbol}] Reduce-only conflict ({e}). Executing exchange-native close_all({symbol})...")
-                try:
-                    await self.client.cancel_all_orders(symbol)
-                    await asyncio.sleep(0.3)
-                    close_ack = await self.client.close_all(symbol)
-                    count = getattr(close_ack, "count", 0)
-                    logger.info(f"[{symbol}] Native close_all executed successfully: count={count}")
-                    self.last_trade_time[symbol] = time.time()
-                    self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
-                    self.position_source_module.pop(symbol, None)
-                    await asyncio.sleep(1.0)
-                    await self.sync_positions()
-                    return True
-                except Exception as e2:
-                    logger.error(f"[{symbol}] Native close_all failed: {e2}")
-            else:
-                logger.error(f"[{symbol}] Order error during close: {e}")
+            logger.info(f"[{symbol}] OrderError during close cascade ({e}). Executing emergency native close_all({symbol})...")
+            try:
+                await self.client.cancel_all_orders(symbol)
+                await asyncio.sleep(0.3)
+                close_ack = await self.client.close_all(symbol)
+                count = getattr(close_ack, "count", 0)
+                logger.info(f"[{symbol}] Native close_all executed successfully: count={count}")
+                self.last_trade_time[symbol] = time.time()
+                self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
+                self.position_source_module.pop(symbol, None)
+                await asyncio.sleep(1.0)
+                await self.sync_positions()
+                return True
+            except Exception as e2:
+                logger.error(f"[{symbol}] Native close_all failed: {e2}")
         except (GDXConnectionError, GDXTimeoutError, ConnectionError, OSError) as e:
             logger.warning(f"[{symbol}] Transient connection drop during close ({e}). Reconnect in progress...")
         except Exception as e:
@@ -2087,6 +2103,7 @@ async def main():
                 passphrase=PASSPHRASE,
                 base_url=WS_URL,
                 transport=transport_config,
+                stream_buffer_size=2048,
             ) as client:
                 async with GodarkRestClient(
                     api_key_id=API_KEY_ID,
