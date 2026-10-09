@@ -392,11 +392,8 @@ KELTNER_PERIOD = 20
 KELTNER_ATR_MULT = 2.0
 
 REGIME_CONFIG = {
-    "FUNDING":     {"module": "C", "weight": 0.50, "leverage": 2, "max_pos": 2},
-    "STAT_ARB":    {"module": "E", "weight": 0.30, "leverage": 2, "max_pos": 2},
+    "FUNDING":     {"module": "C", "weight": 0.80, "leverage": 3, "max_pos": 3},
     "MEAN_REV":    {"module": "B", "weight": 0.20, "leverage": 2, "max_pos": 3},
-    "TREND":       {"module": "A", "weight": 0.00, "leverage": 2, "max_pos": 0},
-    "BREAKOUT":    {"module": "D", "weight": 0.00, "leverage": 2, "max_pos": 0},
 }
 MAX_PORTFOLIO_HEAT = 0.80
 
@@ -407,6 +404,8 @@ GRID_OFFSETS_BPS = {
     "BTC-USDC-PERP": [0.0020, 0.0040, 0.0070],  # 20 bps, 40 bps, 70 bps
 }
 INVENTORY_SKEW_GAMMA = 0.0001
+RESTING_DRIFT_TOLERANCE = 0.0025   # 25 bps drift tolerance before refreshing resting exit order
+MAX_RESTING_AGE_SECONDS = 180.0    # 3 minutes maximum resting order age before refresh
 BREAKEVEN_ATR_MULT = 0.75
 TRAILING_TRIGGER_ATR_MULT = 1.25
 TRAILING_RETRACE_RATIO = 0.35
@@ -421,6 +420,18 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
     try:
         with open(CALIBRATED_CONFIG_PATH, "r", encoding="utf-8") as f:
             cal_data = json.load(f)
+            rm = cal_data.get("risk_management", {})
+            if "max_single_trade_notional" in rm:
+                MAX_SINGLE_TRADE_NOTIONAL = float(rm["max_single_trade_notional"])
+            if "max_portfolio_notional" in rm:
+                MAX_PORTFOLIO_NOTIONAL = float(rm["max_portfolio_notional"])
+            if "trade_cooldown_seconds" in rm:
+                TRADE_COOLDOWN_SECONDS = int(rm["trade_cooldown_seconds"])
+            if "min_atr_ratio" in rm:
+                MIN_ATR_RATIO = float(rm["min_atr_ratio"])
+            if "max_fee_to_profit_ratio" in rm:
+                MAX_FEE_TO_PROFIT_RATIO = float(rm["max_fee_to_profit_ratio"])
+
             mb = cal_data.get("module_b_grid", {})
             if "offsets_bps" in mb:
                 GRID_OFFSETS_BPS.update(mb["offsets_bps"])
@@ -428,6 +439,11 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 INVENTORY_SKEW_GAMMA = float(mb["inventory_skew_gamma"])
             if "round_turn_spread_bps" in mb:
                 MM_ROUND_TURN_SPREAD_BPS = float(mb["round_turn_spread_bps"])
+            if "resting_drift_tolerance" in mb:
+                RESTING_DRIFT_TOLERANCE = float(mb["resting_drift_tolerance"])
+            if "max_resting_age_seconds" in mb:
+                MAX_RESTING_AGE_SECONDS = float(mb["max_resting_age_seconds"])
+
             mc = cal_data.get("module_c_funding", {})
             if "funding_entry_threshold" in mc:
                 FUNDING_ENTRY_THRESHOLD = float(mc["funding_entry_threshold"])
@@ -437,6 +453,7 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 FUNDING_EXIT_THRESHOLD = float(mc["funding_exit_threshold"])
             if "target_carry_notional" in mc:
                 TARGET_CARRY_NOTIONAL = float(mc["target_carry_notional"])
+
             me = cal_data.get("module_e_stat_arb", {})
             if "entry_z_score" in me:
                 STAT_ARB_ENTRY_Z = float(me["entry_z_score"])
@@ -448,6 +465,7 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 STAT_ARB_NOTIONAL = float(me["notional_per_leg"])
             if "lookback_periods" in me:
                 STAT_ARB_LOOKBACK = int(me["lookback_periods"])
+
             pm = cal_data.get("position_management", {})
             if "breakeven_atr_mult" in pm:
                 BREAKEVEN_ATR_MULT = float(pm["breakeven_atr_mult"])
@@ -602,8 +620,11 @@ class QuantitativeTradingAgent:
         # Delta-Neutral Stat-Arb state (ETH/BTC Pair Engine)
         self.eth_btc_ratios: Deque[Tuple[float, float]] = deque(maxlen=STAT_ARB_LOOKBACK * 2)
         self.stat_arb_active: Optional[str] = None  # None, "LONG_ETH_SHORT_BTC", "SHORT_ETH_LONG_BTC"
-        self.stat_arb_entry_z: float = 0.0
         self.position_source_module: Dict[str, str] = {}  # Tracks originating module for each position (e.g. "B", "C", "E")
+        # Resting Exit Order Stability tracking:
+        self.active_exit_orders: Dict[str, str] = {}  # {symbol: order_id}
+        self.active_exit_order_price: Dict[str, float] = {}  # {symbol: price}
+        self.active_exit_order_time: Dict[str, float] = {}  # {symbol: timestamp}
 
     # -------------------------------------------------------------------------
     # Formatting Helpers
@@ -676,6 +697,12 @@ class QuantitativeTradingAgent:
                             "side": side,
                         }
                 self.positions = new_positions
+                # Clean up exit order tracking for closed positions
+                for s in list(self.active_exit_orders.keys()):
+                    if s not in new_positions:
+                        self.active_exit_orders.pop(s, None)
+                        self.active_exit_order_price.pop(s, None)
+                        self.active_exit_order_time.pop(s, None)
         except Exception as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status == 401 and not _retried:
@@ -786,12 +813,15 @@ class QuantitativeTradingAgent:
     async def place_directional_order(
         self, symbol: str, side: str, price: float, qty: float, atr: float, module: str = "A"
     ):
-        effective_atr = max(atr if not pd.isna(atr) else 0.0, price * MIN_ATR_RATIO)
-        sl = price - (1.5 * effective_atr) if side == "BUY" else price + (1.5 * effective_atr)
-
-        # Fee-adjusted TP target: 3.0 * ATR + round-trip fee drag to guarantee positive expectancy
-        fee_drag = price * (self.maker_fee_pct * 2.0)
-        tp = price + (3.0 * effective_atr) + fee_drag if side == "BUY" else price - (3.0 * effective_atr) - fee_drag
+        if module == "C":
+            # Module C Funding Carry: Wide structural bounds (-2.0% SL, +1.5% TP) to hold across funding settlements
+            sl = price * 1.020 if side == "SELL" else price * 0.980
+            tp = price * 0.985 if side == "SELL" else price * 1.015
+        else:
+            effective_atr = max(atr if not pd.isna(atr) else 0.0, price * MIN_ATR_RATIO)
+            sl = price - (1.5 * effective_atr) if side == "BUY" else price + (1.5 * effective_atr)
+            fee_drag = price * (self.maker_fee_pct * 2.0)
+            tp = price + (3.0 * effective_atr) + fee_drag if side == "BUY" else price - (3.0 * effective_atr) - fee_drag
 
         # Fee & Funding Pre-Trade Gate:
         expected_profit = abs(tp - price) * qty
@@ -925,7 +955,7 @@ class QuantitativeTradingAgent:
             logger.error(f"[{symbol}] Unexpected Error placing order: {e}", exc_info=True)
             return False
 
-    async def close_position(self, symbol: str, reason: str = "exit") -> bool:
+    async def close_position(self, symbol: str, reason: str = "exit", aggressive: bool = False) -> bool:
         """Actively close an open position with reduce_only to harvest profit or cut loss."""
         pos = self.positions.get(symbol)
         if not pos:
@@ -939,17 +969,20 @@ class QuantitativeTradingAgent:
         if not mid_price or mid_price <= 0:
             return False
 
-        # 1. Clean up any resting open orders for this symbol first so reduce-only is never blocked
+        # 1. Clean up any open orders for this symbol first so reduce-only is never blocked
         try:
             await self.client.cancel_all_orders(symbol)
             self.open_grid_orders[symbol] = []
+            self.active_exit_orders.pop(symbol, None)
+            self.active_exit_order_price.pop(symbol, None)
+            self.active_exit_order_time.pop(symbol, None)
             await asyncio.sleep(0.3)
         except Exception as e:
             logger.debug(f"[{symbol}] Cancel orders before close notice: {e}")
 
         q_str = self.format_qty(symbol, size)
 
-        # 2. Try passive Maker exit first to capture maker fees (0.015%)
+        # 2. Try passive Maker exit first to capture maker fees (0.015%) unless aggressive close requested
         if side == "BUY":
             target_price = mid_price * (1.0 - MAKER_OFFSET_BPS)
             p_str = self.format_price(symbol, target_price, rounding=ROUND_DOWN)
@@ -960,7 +993,8 @@ class QuantitativeTradingAgent:
         opts_maker = PlaceOrderOptions(reduce_only=True, post_only=True, stp_mode="CANCEL_AGGRESSOR")
 
         logger.info(
-            f"[{symbol}] Routing position close: {side} {q_str} (closing {pos_side} position) | price={p_str} | reason='{reason}'"
+            f"[{symbol}] Routing position close: {side} {q_str} (closing {pos_side} position) | "
+            f"price={p_str} | reason='{reason}' | aggressive={aggressive}"
         )
 
         if DRY_RUN:
@@ -972,25 +1006,35 @@ class QuantitativeTradingAgent:
             return True
 
         try:
-            # 2. Try passive Maker exit first to capture maker fees (0.015%)
-            try:
-                ack = await self.client.place_order(
-                    symbol=symbol,
-                    side=to_sdk_side(side),
-                    order_type=OrderType.LIMIT,
-                    quantity=q_str,
-                    price=p_str,
-                    time_in_force=TimeInForce.GTC,
-                    options=opts_maker,
-                )
-                success = getattr(ack, "success", True)
-                oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
-            except OrderError as e:
-                logger.info(f"[{symbol}] Maker close rejected/crossed ({e}). Routing IOC reduce_only...")
-                success = False
-                oid = None
+            success = False
+            oid = None
 
-            # 3. If maker post_only crossed or rejected, fallback to aggressive IOC reduce_only
+            # 2. Try passive Maker exit first if not aggressive
+            if not aggressive:
+                try:
+                    ack = await self.client.place_order(
+                        symbol=symbol,
+                        side=to_sdk_side(side),
+                        order_type=OrderType.LIMIT,
+                        quantity=q_str,
+                        price=p_str,
+                        time_in_force=TimeInForce.GTC,
+                        options=opts_maker,
+                    )
+                    success = getattr(ack, "success", True)
+                    oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
+                    if success and oid:
+                        self.active_exit_orders[symbol] = str(oid)
+                        self.active_exit_order_price[symbol] = float(target_price)
+                        self.active_exit_order_time[symbol] = time.time()
+                        logger.info(f"[{symbol}] Passive Maker exit order resting on book: order_id={oid} @ {p_str}")
+                        return True
+                except OrderError as e:
+                    logger.info(f"[{symbol}] Maker close rejected/crossed ({e}). Routing IOC reduce_only...")
+                    success = False
+                    oid = None
+
+            # 3. If aggressive or maker post_only crossed/rejected, fallback to aggressive IOC reduce_only
             if not success or not oid:
                 try:
                     logger.info(f"[{symbol}] Routing IOC reduce_only...")
@@ -1026,6 +1070,9 @@ class QuantitativeTradingAgent:
                 self.last_trade_time[symbol] = time.time()
                 self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
                 self.position_source_module.pop(symbol, None)
+                self.active_exit_orders.pop(symbol, None)
+                self.active_exit_order_price.pop(symbol, None)
+                self.active_exit_order_time.pop(symbol, None)
                 if self.telegram.enabled:
                     entry = float(pos.get("entry_price", mid_price))
                     pnl_pct = (mid_price - entry) / entry if pos["size"] > 0 else (entry - mid_price) / entry
@@ -1054,6 +1101,9 @@ class QuantitativeTradingAgent:
                 self.last_trade_time[symbol] = time.time()
                 self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
                 self.position_source_module.pop(symbol, None)
+                self.active_exit_orders.pop(symbol, None)
+                self.active_exit_order_price.pop(symbol, None)
+                self.active_exit_order_time.pop(symbol, None)
                 await asyncio.sleep(1.0)
                 await self.sync_positions()
                 return True
@@ -1066,7 +1116,7 @@ class QuantitativeTradingAgent:
         return False
 
     async def manage_open_position(self, symbol: str, mid_price: float) -> str:
-        """Institutional active position manager: trails profits, triggers TP, cuts losses, and exits on reversals."""
+        """Institutional active position manager: preserves resting maker exit orders, harvests carry, and cuts catastrophic risk."""
         pos = self.positions.get(symbol)
         if not pos or not mid_price or mid_price <= 0:
             return "no_position"
@@ -1074,125 +1124,130 @@ class QuantitativeTradingAgent:
         entry = float(pos["entry_price"])
         size = abs(float(pos["size"]))
         side = pos.get("side", "BUY" if pos["size"] > 0 else "SELL")
-
-        df = self.md_manager.get_dataframe(symbol)
-        if len(df) < 20:
-            return "warming_up"
-
-        df = TechnicalIndicators.calculate_indicators(df)
-        latest = df.iloc[-1]
-        calc_atr = float(latest.get("atr", 0.0) or 0.0)
-        atr = max(calc_atr, entry * MIN_ATR_RATIO)
-
-        # Unrealized PnL percentage and USD amount
         pnl_pct = (mid_price - entry) / entry if side == "BUY" else (entry - mid_price) / entry
         unrealized_usd = pnl_pct * (entry * size)
-
-        # Track Peak Favorable Excursion (PFE) for trailing stops
-        peak_key = f"{symbol}_{side}"
-        self.position_peak_pnl[peak_key] = max(self.position_peak_pnl.get(peak_key, 0.0), pnl_pct)
-        peak_pnl = self.position_peak_pnl[peak_key]
-
-        atr_pct = atr / entry
         source_module = self.position_source_module.get(symbol, self.active_modules.get(symbol, "B"))
 
-        # 0. Market Making (Module B) Fast Round-Turn Exit:
-        # If position originated from MM grid quoting, take profit at MM_ROUND_TURN_SPREAD_BPS (+20 bps)
-        # to immediately capture maker spread and neutralize inventory back to zero.
-        if source_module == "B" or (entry * size) < 10000.0:
-            if pnl_pct >= MM_ROUND_TURN_SPREAD_BPS:
-                logger.info(
-                    f"[{symbol}] [MM_ROUND_TURN] Target +{pnl_pct:.2%} hit (+${unrealized_usd:,.2f}). "
-                    f"Locking in market making spread profit!"
-                )
-                closed = await self.close_position(symbol, reason=f"mm_round_turn_+{pnl_pct:.2%}")
-                if closed:
-                    return "mm_round_turn_closed"
+        now_ts = time.time()
+        active_exit_id = self.active_exit_orders.get(symbol)
+        exit_price = self.active_exit_order_price.get(symbol, 0.0)
+        exit_time = self.active_exit_order_time.get(symbol, 0.0)
 
-        # 0B. Funding Carry (Module C) Normalization Exit:
-        funding = self.funding_rates.get(symbol, 0.0)
+        # 0. Emergency / Protective Stop Loss (Highest Priority - Trumps resting orders)
+        # Module C Stop Loss: -2.0% hard drawdown stop
+        # Module B Stop Loss: -0.60% (60 bps) protective stop
+        stop_loss_pct = -0.020 if source_module == "C" else -0.0060
+        if pnl_pct <= stop_loss_pct:
+            logger.warning(
+                f"[{symbol}] [STOP_LOSS] TRIGGERED: PnL={pnl_pct:.2%} (-${abs(unrealized_usd):,.2f}) "
+                f"below stop threshold {stop_loss_pct:.2%}. Executing emergency close!"
+            )
+            closed = await self.close_position(symbol, reason=f"stop_loss_{pnl_pct:.2%}", aggressive=True)
+            if closed:
+                return "stop_loss_closed"
+
+        # 1. Resting Exit Order Stability:
+        # If exit order is already resting and price hasn't drifted wildly, let it rest (Zero churn!)
+        if active_exit_id and exit_price > 0:
+            drift = abs(mid_price - exit_price) / exit_price
+            age = now_ts - exit_time
+            if drift < RESTING_DRIFT_TOLERANCE and age < MAX_RESTING_AGE_SECONDS:
+                logger.debug(
+                    f"[{symbol}] Resting exit order stable: id={active_exit_id} @ {exit_price:.4f} "
+                    f"(drift={drift:.2%}, age={int(age)}s). Letting it rest."
+                )
+                return f"resting_exit_stable_pnl={pnl_pct:.2%}"
+            else:
+                logger.info(
+                    f"[{symbol}] Refreshing resting exit order: drift={drift:.2%}, age={int(age)}s."
+                )
+
+        # 2. Module C (Funding Carry Arbitrage) Exits:
         if source_module == "C":
+            funding = self.funding_rates.get(symbol, 0.0)
+
+            # 2A. Carry Normalization: Exit when funding drops below threshold (0.5 bps/hr = +4.4% APR)
             if abs(funding) < FUNDING_EXIT_THRESHOLD:
                 logger.info(
                     f"[{symbol}] [CARRY_HARVEST] Funding normalized ({funding:.6f} < {FUNDING_EXIT_THRESHOLD:.6f}). "
                     f"Harvesting carry (+${unrealized_usd:,.2f})..."
                 )
-                closed = await self.close_position(symbol, reason=f"funding_normalized_{funding:.6f}")
+                closed = await self.close_position(symbol, reason=f"funding_normalized_{funding:.6f}", aggressive=False)
                 if closed:
                     return "carry_normalized_closed"
 
-        # 1. Take Profit: Harvest at calibrated TP threshold (e.g. 2.2x ATR)
-        tp_threshold = TAKE_PROFIT_ATR_MULT * atr_pct
-        if pnl_pct >= tp_threshold:
-            logger.info(
-                f"[{symbol}] [TAKE_PROFIT] TARGET HIT: PnL={pnl_pct:.2%} (+${unrealized_usd:,.2f}) "
-                f"reached threshold {tp_threshold:.2%}. Harvesting profit!"
-            )
-            closed = await self.close_position(symbol, reason=f"take_profit_+{pnl_pct:.2%}")
-            if closed:
-                return "harvested_profit"
+            # 2B. Capital Gain Take Profit: +1.5% target
+            if pnl_pct >= 0.015:
+                logger.info(
+                    f"[{symbol}] [CARRY_TP] Capital gain target +{pnl_pct:.2%} hit (+${unrealized_usd:,.2f}). "
+                    f"Locking in profit!"
+                )
+                closed = await self.close_position(symbol, reason=f"carry_tp_+{pnl_pct:.2%}", aggressive=False)
+                if closed:
+                    return "carry_tp_closed"
 
-        # 2. Level 2 Dynamic Trailing Stop (High-Water Mark Retracement):
-        # Once position achieves >= TRAILING_TRIGGER_ATR_MULT (1.25x ATR), allow max 35% retrace from peak
-        if peak_pnl >= (TRAILING_TRIGGER_ATR_MULT * atr_pct) and pnl_pct < (peak_pnl * (1.0 - TRAILING_RETRACE_RATIO)):
-            logger.info(
-                f"[{symbol}] [TRAILING_STOP] TRIGGERED: peak was {peak_pnl:.2%}, retraced to {pnl_pct:.2%}. "
-                f"Locking in +${unrealized_usd:,.2f} profit!"
-            )
-            closed = await self.close_position(symbol, reason=f"trailing_stop_lock_+{pnl_pct:.2%}")
-            if closed:
-                return "trailing_stop_closed"
+            # 2C. Punitive Funding Flip (funding turns negative while holding short, or positive while holding long)
+            if (side == "SELL" and funding < -0.00010) or (side == "BUY" and funding > 0.00010):
+                logger.info(f"[{symbol}] Funding turned punitive ({funding:.6f}) against {side}. Closing carry...")
+                closed = await self.close_position(symbol, reason="funding_flip_exit", aggressive=False)
+                if closed:
+                    return "funding_flip_closed"
 
-        # 3. Level 1 Breakeven Lock with Fee Buffer:
-        # If position gained >= BREAKEVEN_ATR_MULT (0.75x ATR) and drops back to 6 bps (+0.06%), exit to guarantee covering fees
-        if peak_pnl >= (BREAKEVEN_ATR_MULT * atr_pct) and pnl_pct <= 0.0006:
-            logger.info(
-                f"[{symbol}] [BREAKEVEN_LOCK] TRIGGERED: peak was {peak_pnl:.2%}, pulled back to {pnl_pct:.2%}. "
-                f"Exiting at fee breakeven (+${unrealized_usd:,.2f}) to preserve capital!"
-            )
-            closed = await self.close_position(symbol, reason=f"breakeven_lock_+{pnl_pct:.2%}")
-            if closed:
-                return "breakeven_closed"
+            return f"active_carry_{side}_funding={funding:.6f}_pnl={pnl_pct:.2%}_(+${unrealized_usd:,.2f})"
 
-        # 4. Protective Stop Loss: Cut loss if trade drops to -STOP_LOSS_ATR_MULT (1.5x ATR)
-        sl_threshold = STOP_LOSS_ATR_MULT * atr_pct
-        if pnl_pct <= -sl_threshold:
-            logger.info(
-                f"[{symbol}] [STOP_LOSS] HIT: PnL={pnl_pct:.2%} (-${abs(unrealized_usd):,.2f}). "
-                f"Cutting loss to preserve capital!"
-            )
-            closed = await self.close_position(symbol, reason=f"stop_loss_{pnl_pct:.2%}")
-            if closed:
-                return "stop_loss_closed"
+        # 3. Module B (Market Making / Mean Reversion) Exits:
+        if source_module == "B":
+            peak_key = f"{symbol}_{side}"
+            self.position_peak_pnl[peak_key] = max(self.position_peak_pnl.get(peak_key, 0.0), pnl_pct)
+            peak_pnl = self.position_peak_pnl[peak_key]
 
-        # 4. Momentum / Trend Invalidation:
-        ema_20, ema_50 = float(latest["ema_20"]), float(latest["ema_50"])
-        rsi = float(latest["rsi"]) if not pd.isna(latest["rsi"]) else 50.0
+            # 3A. Spread Take Profit: target +20 bps round-turn
+            if pnl_pct >= MM_ROUND_TURN_SPREAD_BPS:
+                logger.info(
+                    f"[{symbol}] [MM_ROUND_TURN] Target +{pnl_pct:.2%} hit (+${unrealized_usd:,.2f}). "
+                    f"Locking in spread profit!"
+                )
+                closed = await self.close_position(symbol, reason=f"mm_round_turn_+{pnl_pct:.2%}", aggressive=False)
+                if closed:
+                    return "mm_round_turn_closed"
 
-        if side == "SELL" and (ema_20 > ema_50) and rsi > 58.0 and pnl_pct < 0.002:
-            logger.info(f"[{symbol}] [REVERSAL] Bullish reversal detected against SHORT (RSI={rsi:.1f}). Closing early...")
-            closed = await self.close_position(symbol, reason="trend_reversal_exit")
-            if closed:
-                return "reversal_closed"
+            # 3B. Fee Breakeven Lock: if peak reached +15 bps and retraces to +6 bps
+            if peak_pnl >= 0.0015 and pnl_pct <= 0.0006:
+                logger.info(
+                    f"[{symbol}] [MM_BREAKEVEN] Peak {peak_pnl:.2%} pulled back to {pnl_pct:.2%}. "
+                    f"Exiting at fee breakeven (+${unrealized_usd:,.2f})."
+                )
+                closed = await self.close_position(symbol, reason=f"mm_breakeven_+{pnl_pct:.2%}", aggressive=False)
+                if closed:
+                    return "mm_breakeven_closed"
 
-        elif side == "BUY" and (ema_20 < ema_50) and rsi < 42.0 and pnl_pct < 0.002:
-            logger.info(f"[{symbol}] [REVERSAL] Bearish reversal detected against LONG (RSI={rsi:.1f}). Closing early...")
-            closed = await self.close_position(symbol, reason="trend_reversal_exit")
-            if closed:
-                return "reversal_closed"
+            # 3C. Ensure passive counter order is resting at entry +- 20 bps
+            if not active_exit_id:
+                counter_side = "SELL" if side == "BUY" else "BUY"
+                target_price = entry * (1.0 + MM_ROUND_TURN_SPREAD_BPS) if side == "BUY" else entry * (1.0 - MM_ROUND_TURN_SPREAD_BPS)
+                p_str = self.format_price(symbol, target_price, rounding=ROUND_UP if counter_side == "SELL" else ROUND_DOWN)
+                q_str = self.format_qty(symbol, size)
+                opts = PlaceOrderOptions(reduce_only=True, post_only=True, stp_mode="CANCEL_AGGRESSOR")
+                try:
+                    ack = await self.client.place_order(
+                        symbol=symbol,
+                        side=to_sdk_side(counter_side),
+                        order_type=OrderType.LIMIT,
+                        quantity=q_str,
+                        price=p_str,
+                        time_in_force=TimeInForce.GTC,
+                        options=opts,
+                    )
+                    oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
+                    if getattr(ack, "success", True) and oid:
+                        self.active_exit_orders[symbol] = str(oid)
+                        self.active_exit_order_price[symbol] = float(target_price)
+                        self.active_exit_order_time[symbol] = time.time()
+                        logger.info(f"[{symbol}] [MM_ROUND_TURN] Posted resting counter order {counter_side} {q_str} @ {p_str}")
+                except Exception as e:
+                    logger.debug(f"[{symbol}] Counter order post notice: {e}")
 
-        # 5. Funding Headwind Invalidation (Carry Protection)
-        funding = self.funding_rates.get(symbol, 0.0)
-        if side == "SELL" and funding < -0.00010:
-            logger.info(f"[{symbol}] Funding turned punitive ({funding:.6f}) against SHORT. Closing carry...")
-            closed = await self.close_position(symbol, reason="funding_flip_exit")
-            if closed:
-                return "funding_flip_closed"
-        elif side == "BUY" and funding > 0.00010:
-            logger.info(f"[{symbol}] Funding turned punitive ({funding:.6f}) against LONG. Closing carry...")
-            closed = await self.close_position(symbol, reason="funding_flip_exit")
-            if closed:
-                return "funding_flip_closed"
+            return f"active_mm_{side}_pnl={pnl_pct:.2%}_(+${unrealized_usd:,.2f})"
 
         return f"active_{side}_pnl={pnl_pct:.2%}_(+${unrealized_usd:,.2f})"
 
@@ -1224,7 +1279,7 @@ class QuantitativeTradingAgent:
 
         if active_ids and last_mid > 0:
             price_drift = abs(mid_price - last_mid) / last_mid
-            if price_drift < 0.0015 and (now_ts - last_time) < 90.0:
+            if price_drift < RESTING_DRIFT_TOLERANCE and (now_ts - last_time) < MAX_RESTING_AGE_SECONDS:
                 logger.debug(f"[{symbol}] Grid resting orders stable (drift={price_drift:.2%}), skipping re-quote.")
                 return "grid_stable"
 
@@ -1553,8 +1608,12 @@ class QuantitativeTradingAgent:
                 time_in_force=TimeInForce.GTC,
                 options=opts,
             )
-            if getattr(ack, "success", True):
-                logger.info(f"[{symbol}] [MM_ROUND_TURN] Counter order placed successfully.")
+            oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
+            if getattr(ack, "success", True) and oid:
+                self.active_exit_orders[symbol] = str(oid)
+                self.active_exit_order_price[symbol] = float(target_price)
+                self.active_exit_order_time[symbol] = time.time()
+                logger.info(f"[{symbol}] [MM_ROUND_TURN] Counter order placed successfully and resting: order_id={oid} @ {p_str}")
             else:
                 logger.warning(f"[{symbol}] [MM_ROUND_TURN] Counter order placement notice: {getattr(ack, 'error', None)}")
         except Exception as e:
@@ -1702,14 +1761,11 @@ class QuantitativeTradingAgent:
 
         funding = abs(self.funding_rates.get(symbol, 0.0))
 
-        # Institutional Regime Priority:
-        # 1. High Funding Yield (> 10 bps/hr): Prioritize Carry Harvesting (Risk-Free Cash Yield)
+        # Institutional Dual-Engine Architecture:
+        # 1. High Funding Yield (>= FUNDING_SHORT_THRESHOLD): Prioritize Carry Harvesting (Module C)
         if funding >= FUNDING_SHORT_THRESHOLD:
             raw_regime = "FUNDING"
-        # 2. Cointegrated Delta-Neutral Stat-Arb pair active
-        elif symbol in ("ETH-USDC-PERP", "BTC-USDC-PERP") and self.stat_arb_active:
-            raw_regime = "STAT_ARB"
-        # 3. Dense Market Making with Instant Round-Turn Spread Harvesting
+        # 2. Dense Market Making with Instant Round-Turn Spread Harvesting (Module B)
         else:
             raw_regime = "MEAN_REV"
 
@@ -1830,10 +1886,10 @@ class QuantitativeTradingAgent:
 
         module = config["module"]
 
-        # Institutional frequency control: enforce 10-minute cooldown on directional entries to stop churn
+        # Institutional frequency control: enforce cooldown on carry entries to stop churn
         now_ts = time.time()
         time_since_trade = now_ts - self.last_trade_time.get(symbol, 0.0)
-        if module in ("A", "C", "D") and time_since_trade < TRADE_COOLDOWN_SECONDS:
+        if module == "C" and time_since_trade < TRADE_COOLDOWN_SECONDS:
             rem_cd = int(TRADE_COOLDOWN_SECONDS - time_since_trade)
             logger.info(
                 f"[{symbol}] regime={regime} module={module} mid={mid_price:.6g} "
@@ -1841,14 +1897,10 @@ class QuantitativeTradingAgent:
             )
             return
 
-        if module == "A":
-            result = await self.execute_trend_module(symbol, mid_price)
+        if module == "C":
+            result = await self.execute_funding_module(symbol, mid_price)
         elif module == "B":
             result = await self.execute_grid_module(symbol, mid_price)
-        elif module == "C":
-            result = await self.execute_funding_module(symbol, mid_price)
-        elif module == "D":
-            result = await self.execute_breakout_module(symbol, mid_price)
         else:
             result = "unrouted"
         logger.info(
@@ -1903,6 +1955,12 @@ class QuantitativeTradingAgent:
                             order_id=str(oid) if oid else None,
                         )
                         await self.telegram.send(msg)
+
+                    # If this fill was our active exit order, clear tracking
+                    if oid and str(oid) == str(self.active_exit_orders.get(symbol)):
+                        self.active_exit_orders.pop(symbol, None)
+                        self.active_exit_order_price.pop(symbol, None)
+                        self.active_exit_order_time.pop(symbol, None)
 
                     # Trigger instant round-turn counter order if fill was for Market Making lot
                     mod = self.position_source_module.get(symbol, self.active_modules.get(symbol, "B"))
@@ -2049,13 +2107,7 @@ class QuantitativeTradingAgent:
                     logger.debug(f"Position sync notice: {e}")
 
                 if self.system_health_accepting:
-                    # 1. Delta-Neutral Cointegrated Stat-Arb Pair (ETH/BTC)
-                    try:
-                        await self.evaluate_stat_arb_pair()
-                    except Exception as e:
-                        logger.error(f"Stat-Arb Execution Error: {e}", exc_info=True)
-
-                    # 2. Individual Symbol Execution (Funding Carry & Dense MM)
+                    # Institutional Dual-Engine Evaluation: Module C (Funding Carry) & Module B (Dense MM)
                     for symbol in SYMBOLS:
                         try:
                             await self.evaluate_symbol(symbol)

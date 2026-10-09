@@ -1,27 +1,20 @@
 {
-  "version": "1.2.0",
-  "timestamp": "2026-10-09T12:00:00.000000Z",
+  "version": "2.0.0",
+  "timestamp": "2026-10-09T18:15:00.000000Z",
   "target_apr_pct": 30.0,
   "daily_profit_target_usd": 822.0,
   "risk_management": {
     "risk_factor": 0.002,
-    "max_single_trade_notional": 120000.0,
-    "max_portfolio_notional": 400000.0,
-    "trade_cooldown_seconds": 600,
+    "max_single_trade_notional": 100000.0,
+    "max_portfolio_notional": 350000.0,
+    "trade_cooldown_seconds": 180,
     "min_atr_ratio": 0.006,
     "max_fee_to_profit_ratio": 0.25
   },
   "module_c_funding": {
     "funding_entry_threshold": 0.00010,
     "funding_exit_threshold": 0.00003,
-    "target_carry_notional": 70000.0
-  },
-  "module_e_stat_arb": {
-    "entry_z_score": 1.75,
-    "exit_z_score": 0.30,
-    "stop_loss_z_score": 3.20,
-    "notional_per_leg": 30000.0,
-    "lookback_periods": 60
+    "target_carry_notional": 90000.0
   },
   "module_b_grid": {
     "offsets_bps": {
@@ -42,8 +35,8 @@
       ]
     },
     "inventory_skew_gamma": 0.0001,
-    "resting_drift_tolerance": 0.0015,
-    "max_resting_age_seconds": 90.0,
+    "resting_drift_tolerance": 0.0025,
+    "max_resting_age_seconds": 180.0,
     "round_turn_spread_bps": 0.0020
   },
   "position_management": {

@@ -111,6 +111,56 @@ class TestQuantAgentSimulation(unittest.TestCase):
 
         asyncio.run(run_async())
 
+    def test_resting_exit_order_stability(self):
+        """Verify that resting Maker exit orders are not cancelled/replaced on small price drift."""
+        import time
+
+        async def run_async():
+            sym = "BTC-USDC-PERP"
+            self.agent.positions[sym] = {
+                "symbol": sym,
+                "size": -1.0,
+                "notional": -80000.0,
+                "entry_price": 80000.0,
+                "side": "SELL",
+            }
+            self.agent.position_source_module[sym] = "C"
+            self.agent.funding_rates[sym] = 0.000450
+            self.agent.active_exit_orders[sym] = "RESTING_EXIT_999"
+            self.agent.active_exit_order_price[sym] = 78800.0
+            self.agent.active_exit_order_time[sym] = time.time()
+
+            # Mid price is 78810.0 (drift is ~1.2 bps, well under 25 bps tolerance)
+            status = await self.agent.manage_open_position(sym, 78810.0)
+            self.assertIn("resting_exit_stable", status)
+            self.assertEqual(self.agent.active_exit_orders.get(sym), "RESTING_EXIT_999")
+
+        asyncio.run(run_async())
+
+    def test_oversold_rsi_does_not_panic_exit(self):
+        """Verify that oversold RSI does not trigger a panic exit on dip buys."""
+        async def run_async():
+            sym = "ETH-USDC-PERP"
+            # Feed declining price series to make RSI very low (< 30)
+            for i in range(30):
+                p = 2600.0 - (i * 5.0)
+                self.agent.md_manager.push_tick(sym, p)
+
+            self.agent.positions[sym] = {
+                "symbol": sym,
+                "size": 10.0,
+                "notional": 24500.0,
+                "entry_price": 2450.0,
+                "side": "BUY",
+            }
+            self.agent.position_source_module[sym] = "B"
+
+            # Check manage_open_position at 2451.0 (slight gain, low RSI)
+            status = await self.agent.manage_open_position(sym, 2451.0)
+            self.assertNotEqual(status, "reversal_closed")
+
+        asyncio.run(run_async())
+
 
 if __name__ == "__main__":
     unittest.main()
