@@ -177,5 +177,38 @@ class TestQuantAgentSimulation(unittest.TestCase):
         asyncio.run(run_async())
 
 
+    def test_candle_seeding_and_trend_entry(self):
+        """Verify that seeding 60 1m candles sets authentic indicators and allows trend entry."""
+        async def run_async():
+            sym = "ETH-USDC-PERP"
+            candles = []
+            base = 2500.0
+            for i in range(60):
+                c = base + (i * 0.5)
+                candles.append({
+                    "c": c,
+                    "h": c + 2.0,
+                    "l": c - 2.0,
+                    "v": 100.0,
+                })
+            self.agent.md_manager.seed_candles(sym, candles)
+            self.assertEqual(len(self.agent.md_manager.price_history[sym]), 60)
+            self.assertEqual(self.agent.md_manager.current_mids[sym], candles[-1]["c"])
+
+            # Update live mid price
+            self.agent.md_manager.update_live_mid(sym, candles[-1]["c"] + 0.1)
+            self.assertAlmostEqual(self.agent.md_manager.current_mids[sym], candles[-1]["c"] + 0.1)
+
+            self.agent.funding_rates[sym] = 0.000020
+            regime = self.agent._detect_regime(sym)
+            self.assertEqual(regime, "TREND")
+
+            res = await self.agent.execute_trend_module(sym, self.agent.md_manager.current_mids[sym])
+            self.assertIn(res, ["entered_long", "entered_short", "no_signal"])
+
+        asyncio.run(run_async())
+
+
 if __name__ == "__main__":
     unittest.main()
+

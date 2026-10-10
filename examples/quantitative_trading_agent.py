@@ -563,11 +563,46 @@ class MarketDataManager:
         if len(self.price_history[symbol]) > 600:
             self.price_history[symbol].pop(0)
 
+    def seed_candles(self, symbol: str, candles: List[Dict[str, Any]]):
+        if not candles:
+            return
+        records = []
+        for c in candles:
+            close = float(c.get("c", c.get("close", 0.0)))
+            high = float(c.get("h", c.get("high", close)))
+            low = float(c.get("l", c.get("low", close)))
+            volume = float(c.get("v", c.get("volume", 0.0)))
+            if close > 0:
+                records.append({
+                    "close": close,
+                    "high": high,
+                    "low": low,
+                    "volume": volume,
+                })
+        if records:
+            self.price_history[symbol] = records[-300:]
+            self.current_mids[symbol] = records[-1]["close"]
+
+    def update_live_mid(self, symbol: str, price: float):
+        if not price or price <= 0:
+            return
+        self.current_mids[symbol] = price
+        if not self.price_history.get(symbol):
+            self.push_tick(symbol, price)
+            return
+        last = self.price_history[symbol][-1]
+        last["close"] = price
+        if price > last["high"]:
+            last["high"] = price
+        if price < last["low"]:
+            last["low"] = price
+
     def get_dataframe(self, symbol: str) -> pd.DataFrame:
         data = self.price_history.get(symbol, [])
         if not data:
             return pd.DataFrame(columns=["close", "high", "low", "volume"])
         return pd.DataFrame(data)
+
 
 
 # -----------------------------------------------------------------------------
@@ -1490,7 +1525,8 @@ class QuantitativeTradingAgent:
         prev_ema20, prev_ema50 = float(prev["ema_20"]), float(prev["ema_50"])
         rsi = float(latest["rsi"]) if not pd.isna(latest["rsi"]) else 50.0
         calc_atr = float(latest["atr"]) if not pd.isna(latest["atr"]) else 0.0
-        atr = max(calc_atr, close * MIN_ATR_RATIO)
+        real_atr = calc_atr if calc_atr > 0 else (close * MIN_ATR_RATIO)
+        effective_atr = max(calc_atr, close * MIN_ATR_RATIO)
         adx = float(latest.get("adx", 0.0) or 0.0)
         funding = self.funding_rates.get(symbol, 0.0)
 
@@ -1498,40 +1534,40 @@ class QuantitativeTradingAgent:
         if adx < 14.0:
             return "low_adx"
 
-        # EMA Separation Buffer: 0.05x ATR (eliminates micro-touches while capturing real trend legs)
+        # EMA Separation Buffer: 0.05x real_atr (eliminates micro-touches while capturing real trend legs)
         ema_spread = abs(ema_20 - ema_50)
-        if ema_spread < (0.05 * atr):
+        if ema_spread < (0.05 * real_atr):
             return "tight_ema_spread"
 
         bullish_cross = (prev_ema20 <= prev_ema50) and (ema_20 > ema_50)
         bearish_cross = (prev_ema20 >= prev_ema50) and (ema_20 < ema_50)
-        bullish_trend = (ema_20 > ema_50) and (close >= ema_20)
-        bearish_trend = (ema_20 < ema_50) and (close <= ema_20)
+        bullish_trend = (ema_20 > ema_50) and (close >= ema_50)
+        bearish_trend = (ema_20 < ema_50) and (close <= ema_50)
 
         config = REGIME_CONFIG["TREND"]
 
-        # LONG: confirmed bullish momentum, RSI corridor (45-70), no punitive funding headwind
-        if (bullish_cross or bullish_trend) and (45.0 <= rsi <= 70.0) and (funding <= 0.0004):
+        # LONG: confirmed bullish momentum, RSI corridor (38-68), no punitive funding headwind
+        if (bullish_cross or bullish_trend) and (38.0 <= rsi <= 68.0) and (funding <= 0.0004):
             if self._get_active_module_count("A") >= config["max_pos"] or not self._check_portfolio_heat():
                 return "blocked_risk"
             await self._switch_module(symbol, "A")
             await self._set_leverage(symbol, config["leverage"])
             # Pullback pricing anchor: enter near EMA20 or close
             entry_price = min(close, ema_20 * 1.001)
-            qty = await self.calculate_risk_position_size(symbol, entry_price, atr)
-            ok = await self.place_directional_order(symbol, "BUY", entry_price, qty, atr, module="A")
+            qty = await self.calculate_risk_position_size(symbol, entry_price, effective_atr)
+            ok = await self.place_directional_order(symbol, "BUY", entry_price, qty, effective_atr, module="A")
             return "entered_long" if ok else "order_rejected"
 
-        # SHORT: confirmed bearish momentum, RSI corridor (30-55), no punitive funding headwind
-        elif (bearish_cross or bearish_trend) and (30.0 <= rsi <= 55.0) and (funding >= -0.0004):
+        # SHORT: confirmed bearish momentum, RSI corridor (32-62), no punitive funding headwind
+        elif (bearish_cross or bearish_trend) and (32.0 <= rsi <= 62.0) and (funding >= -0.0004):
             if self._get_active_module_count("A") >= config["max_pos"] or not self._check_portfolio_heat():
                 return "blocked_risk"
             await self._switch_module(symbol, "A")
             await self._set_leverage(symbol, config["leverage"])
             # Pullback pricing anchor: enter near EMA20 or close
             entry_price = max(close, ema_20 * 0.999)
-            qty = await self.calculate_risk_position_size(symbol, entry_price, atr)
-            ok = await self.place_directional_order(symbol, "SELL", entry_price, qty, atr, module="A")
+            qty = await self.calculate_risk_position_size(symbol, entry_price, effective_atr)
+            ok = await self.place_directional_order(symbol, "SELL", entry_price, qty, effective_atr, module="A")
             return "entered_short" if ok else "order_rejected"
 
         return "no_signal"
@@ -1872,14 +1908,65 @@ class QuantitativeTradingAgent:
 
         self.active_modules[symbol] = new_module
 
+    async def seed_historical_candles(self):
+        logger.info("Seeding historical 1-minute candles from Hyperliquid reference feed...")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                now_ms = int(time.time() * 1000)
+                start_ms = now_ms - (3600 * 1000)
+                for symbol, key in REFERENCE_MID_KEYS.items():
+                    try:
+                        resp = await http.post(
+                            REFERENCE_MID_URL,
+                            json={"type": "candleSnapshot", "req": {"coin": key, "interval": "1m", "startTime": start_ms}},
+                        )
+                        if resp.status_code == 200:
+                            candles = resp.json()
+                            if candles and isinstance(candles, list):
+                                self.md_manager.seed_candles(symbol, candles)
+                                self._ref_fed.add(symbol)
+                                logger.info(
+                                    f"[{symbol}] Seeded {len(candles)} 1m candles (close=${candles[-1].get('c')})"
+                                )
+                    except Exception as e:
+                        logger.warning(f"[{symbol}] Historical candle seeding notice: {e}")
+        except Exception as e:
+            logger.warning(f"Error seeding historical candles: {e}")
+
+    async def _sync_candles_background(self):
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as http:
+                now_ms = int(time.time() * 1000)
+                start_ms = now_ms - (3600 * 1000)
+                for symbol, key in REFERENCE_MID_KEYS.items():
+                    try:
+                        resp = await http.post(
+                            REFERENCE_MID_URL,
+                            json={"type": "candleSnapshot", "req": {"coin": key, "interval": "1m", "startTime": start_ms}},
+                        )
+                        if resp.status_code == 200:
+                            candles = resp.json()
+                            if candles and isinstance(candles, list):
+                                self.md_manager.seed_candles(symbol, candles)
+                    except Exception as e:
+                        logger.debug(f"[{symbol}] Candle sync notice: {e}")
+        except Exception as e:
+            logger.debug(f"Candle sync background notice: {e}")
+
     async def feed_prices_from_reference(self):
         """Live mid prices from Hyperliquid (the venue has no public price feed).
 
         Falls back to the OI-implied price in feed_prices_from_rest until the
-        first reference tick arrives for a symbol.
+        first reference tick arrives for a symbol. Periodically syncs 1m candles.
         """
+        last_candle_sync = time.time()
         while self.running:
             try:
+                now_ts = time.time()
+                if (now_ts - last_candle_sync) >= 60.0:
+                    asyncio.create_task(self._sync_candles_background())
+                    last_candle_sync = now_ts
+
                 async with httpx.AsyncClient(timeout=5.0) as http:
                     resp = await http.post(REFERENCE_MID_URL, json={"type": "allMids"})
                     resp.raise_for_status()
@@ -1887,7 +1974,7 @@ class QuantitativeTradingAgent:
                 for symbol, key in REFERENCE_MID_KEYS.items():
                     price = float(mids.get(key, 0) or 0)
                     if price > 0:
-                        self.md_manager.push_tick(symbol, price)
+                        self.md_manager.update_live_mid(symbol, price)
                         self._ref_fed.add(symbol)
             except Exception as e:
                 logger.debug(f"Reference price feed notice: {e}")
@@ -2158,6 +2245,7 @@ class QuantitativeTradingAgent:
         await self._fetch_tier_status()
         await self.sync_positions()
         await self._seed_funding_rates()
+        await self.seed_historical_candles()
         asyncio.create_task(self.listen_order_updates())
         asyncio.create_task(self.feed_prices_from_rest())
         asyncio.create_task(self.feed_prices_from_reference())
