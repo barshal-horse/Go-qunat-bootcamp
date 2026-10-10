@@ -339,16 +339,16 @@ if not all([API_KEY_ID, API_SECRET, PASSPHRASE]):
 REST_BASE_URL = WS_URL.replace("wss://", "https://").replace("ws://", "http://")
 SYMBOLS = ["BTC-USDC-PERP", "ETH-USDC-PERP", "SOL-USDC-PERP"]
 DEFAULT_LEVERAGE = 3
-# Risk & Capital Architecture (Optimized for $1M pool targeting 30% APR / ~$822/day)
-# 0.20% risk per trade = $2,000 risk budget. At 1% SL = $100k-$120k notional position.
-RISK_FACTOR = 0.002
-MAX_SINGLE_TRADE_NOTIONAL = 120000.0  # Max $120k notional per single trade (~0.12x portfolio leverage)
-MAX_PORTFOLIO_NOTIONAL = 400000.0     # Max $400k total notional across all 3 assets (~0.40x total leverage)
-TRADE_COOLDOWN_SECONDS = 600          # 10-minute cooldown per symbol to eliminate overtrading churn
+# Risk & Capital Architecture (Scaled for Bootcamp Aggressive Growth on $1M pool)
+# 1.00% risk per trade = $10,000 risk budget. At ~1.5%-1.8% SL = $150k-$250k notional position.
+RISK_FACTOR = 0.010
+MAX_SINGLE_TRADE_NOTIONAL = 250000.0  # Max $250k notional per single trade (~0.25x portfolio leverage)
+MAX_PORTFOLIO_NOTIONAL = 600000.0     # Max $600k total notional across all 3 assets (~0.60x total leverage)
+TRADE_COOLDOWN_SECONDS = 180          # 3-minute cooldown per symbol
 
 LOOP_INTERVAL_SECONDS = 15
 FEED_INTERVAL_SECONDS = 2
-MIN_NOTIONAL_USD = 100.0
+MIN_NOTIONAL_USD = 1000.0
 DECIMALS_MAP = load_offline_decimals_map()
 SYMBOL_IDS = {"BTC-USDC-PERP": 1, "ETH-USDC-PERP": 2, "SOL-USDC-PERP": 5}
 SYMBOL_BY_ID = {v: k for k, v in SYMBOL_IDS.items()}
@@ -364,25 +364,25 @@ DEFAULT_MAKER_FEE_PCT = 0.00015
 DEFAULT_TAKER_FEE_PCT = 0.00055
 MAKER_OFFSET_BPS = 0.0003  # 3 bps passive limit offset from mid for maker capture
 MIN_ATR_RATIO = 0.006      # 0.6% price floor for ATR to prevent micro-stops on 2s ticks
-MAX_FEE_TO_PROFIT_RATIO = 0.25  # Block trade if fees+funding exceed 25% of expected TP profit
-REGIME_STABILITY_CYCLES = 2    # Consecutive cycles needed before regime transition
+MAX_FEE_TO_PROFIT_RATIO = 0.15  # Block trade if fees+funding exceed 15% of expected TP profit
+REGIME_STABILITY_CYCLES = 1    # Immediate transition on clear trend signals
 
-# Module C: Funding Carry Arbitrage (Primary Structural Yield Engine)
-FUNDING_ENTRY_THRESHOLD = 0.00010   # 10 bps/hr (~87.6% APR) threshold to enter carry trade
-FUNDING_LONG_THRESHOLD = -0.00010   # Shorts pay longs: enter LONG
-FUNDING_SHORT_THRESHOLD = 0.00010   # Longs pay shorts: enter SHORT
-FUNDING_EXIT_THRESHOLD = 0.00003    # 3 bps/hr threshold to exit when carry normalizes
+# Module C: Funding Carry Arbitrage (Strategic Yield Engine)
+FUNDING_ENTRY_THRESHOLD = 0.00015   # 15 bps/hr (~131% APR) threshold to enter carry trade
+FUNDING_LONG_THRESHOLD = -0.00015   # Shorts pay longs: enter LONG
+FUNDING_SHORT_THRESHOLD = 0.00015   # Longs pay shorts: enter SHORT
+FUNDING_EXIT_THRESHOLD = 0.00005    # 5 bps/hr threshold to exit when carry normalizes
 FUNDING_MAX_HOLD_HOURS = 24
-TARGET_CARRY_NOTIONAL = 70000.0     # Target $70k notional per carry asset ($140k total on 2 assets = 0.14x leverage)
+TARGET_CARRY_NOTIONAL = 200000.0    # Target $200k notional per carry asset
 
 # Module E: Delta-Neutral Cointegrated Stat-Arb (ETH/BTC Pair Engine)
 STAT_ARB_ENTRY_Z = 1.75             # Enter pair when ratio diverged >= 1.75 standard deviations
 STAT_ARB_EXIT_Z = 0.30              # Exit pair when ratio mean-reverts to within 0.30 std devs
 STAT_ARB_STOP_Z = 3.20              # Divergence stop-loss threshold
-STAT_ARB_NOTIONAL = 30000.0         # $30k per leg ($60k total pair notional = 0.06x leverage)
+STAT_ARB_NOTIONAL = 50000.0         # $50k per leg ($100k total pair notional = 0.10x leverage)
 STAT_ARB_LOOKBACK = 60              # 60 rolling ticks/periods for z-score calculation
 
-# Module B: Dense Maker Market Making with Instant Round-Turn
+# Module B: Dense Maker Market Making with Instant Round-Turn (Preserved for unit tests)
 MM_ROUND_TURN_SPREAD_BPS = 0.0020   # 20 bps target for instant market-making round-turn
 
 OI_LOOKBACK_HOURS = 4
@@ -391,26 +391,27 @@ OI_SURGE_THRESHOLD = 0.20
 KELTNER_PERIOD = 20
 KELTNER_ATR_MULT = 2.0
 
+# Bootcamp Winning Strategy Architecture: Primary Directional Trend (85%) + Funding Carry (15%)
 REGIME_CONFIG = {
-    "FUNDING":     {"module": "C", "weight": 0.80, "leverage": 3, "max_pos": 3},
-    "MEAN_REV":    {"module": "B", "weight": 0.20, "leverage": 2, "max_pos": 3},
+    "TREND":       {"module": "A", "weight": 0.85, "leverage": 3, "max_pos": 3},
+    "FUNDING":     {"module": "C", "weight": 0.15, "leverage": 3, "max_pos": 2},
 }
 MAX_PORTFOLIO_HEAT = 0.80
 
-# Calibrated parameters & RL dynamic quoting defaults (Dense 3-tier inside spreads)
+# Dynamic quoting and trade management parameters
 GRID_OFFSETS_BPS = {
-    "SOL-USDC-PERP": [0.0016, 0.0032, 0.0055],  # 16 bps, 32 bps, 55 bps
-    "ETH-USDC-PERP": [0.0018, 0.0036, 0.0060],  # 18 bps, 36 bps, 60 bps
-    "BTC-USDC-PERP": [0.0020, 0.0040, 0.0070],  # 20 bps, 40 bps, 70 bps
+    "SOL-USDC-PERP": [0.0016, 0.0032, 0.0055],
+    "ETH-USDC-PERP": [0.0018, 0.0036, 0.0060],
+    "BTC-USDC-PERP": [0.0020, 0.0040, 0.0070],
 }
 INVENTORY_SKEW_GAMMA = 0.0001
 RESTING_DRIFT_TOLERANCE = 0.0025   # 25 bps drift tolerance before refreshing resting exit order
-MAX_RESTING_AGE_SECONDS = 180.0    # 3 minutes maximum resting order age before refresh
-BREAKEVEN_ATR_MULT = 0.75
-TRAILING_TRIGGER_ATR_MULT = 1.25
+MAX_RESTING_AGE_SECONDS = 300.0    # 5 minutes maximum resting order age before refresh
+BREAKEVEN_ATR_MULT = 1.0
+TRAILING_TRIGGER_ATR_MULT = 1.5
 TRAILING_RETRACE_RATIO = 0.35
-TAKE_PROFIT_ATR_MULT = 2.2
-STOP_LOSS_ATR_MULT = 1.5
+TAKE_PROFIT_ATR_MULT = 3.0
+STOP_LOSS_ATR_MULT = 1.8
 
 # Check if external calibrated params exist and load them
 CALIBRATED_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "calibrated_params.json")
@@ -421,6 +422,8 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
         with open(CALIBRATED_CONFIG_PATH, "r", encoding="utf-8") as f:
             cal_data = json.load(f)
             rm = cal_data.get("risk_management", {})
+            if "risk_factor" in rm:
+                RISK_FACTOR = float(rm["risk_factor"])
             if "max_single_trade_notional" in rm:
                 MAX_SINGLE_TRADE_NOTIONAL = float(rm["max_single_trade_notional"])
             if "max_portfolio_notional" in rm:
@@ -431,18 +434,6 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 MIN_ATR_RATIO = float(rm["min_atr_ratio"])
             if "max_fee_to_profit_ratio" in rm:
                 MAX_FEE_TO_PROFIT_RATIO = float(rm["max_fee_to_profit_ratio"])
-
-            mb = cal_data.get("module_b_grid", {})
-            if "offsets_bps" in mb:
-                GRID_OFFSETS_BPS.update(mb["offsets_bps"])
-            if "inventory_skew_gamma" in mb:
-                INVENTORY_SKEW_GAMMA = float(mb["inventory_skew_gamma"])
-            if "round_turn_spread_bps" in mb:
-                MM_ROUND_TURN_SPREAD_BPS = float(mb["round_turn_spread_bps"])
-            if "resting_drift_tolerance" in mb:
-                RESTING_DRIFT_TOLERANCE = float(mb["resting_drift_tolerance"])
-            if "max_resting_age_seconds" in mb:
-                MAX_RESTING_AGE_SECONDS = float(mb["max_resting_age_seconds"])
 
             mc = cal_data.get("module_c_funding", {})
             if "funding_entry_threshold" in mc:
@@ -728,25 +719,31 @@ class QuantitativeTradingAgent:
 
     async def calculate_risk_position_size(self, symbol: str, entry_price: float, atr: float) -> float:
         collateral = await self.get_collateral_balance()
-        # 0.20% portfolio risk per trade = ~$2,000 risk budget on $1M pool
+        # 1.00% portfolio risk per trade = ~$10,000 risk budget on $1M pool
         risk_budget = collateral * RISK_FACTOR
 
-        # Volatility floor: at least MIN_ATR_RATIO (0.6%) of price to prevent micro-stops on 2s ticks
+        # Volatility floor: at least MIN_ATR_RATIO (0.6%) of price
         min_atr = entry_price * MIN_ATR_RATIO
         effective_atr = max(atr if not pd.isna(atr) else 0.0, min_atr)
-        sl_distance = 1.5 * effective_atr
+        sl_distance = STOP_LOSS_ATR_MULT * effective_atr
 
         # Deduct estimated round-trip fee buffer from risk budget
-        fee_buffer_mult = (self.maker_fee_pct + self.taker_fee_pct) * DEFAULT_LEVERAGE
-        net_risk_budget = max(risk_budget * (1.0 - fee_buffer_mult), risk_budget * 0.8)
+        fee_buffer_mult = (self.maker_fee_pct * 2.0) * DEFAULT_LEVERAGE
+        net_risk_budget = max(risk_budget * (1.0 - fee_buffer_mult), risk_budget * 0.9)
 
         raw_qty = net_risk_budget / sl_distance
 
-        # Size caps for institutional 30% APR goal:
-        # Cap at MAX_SINGLE_TRADE_NOTIONAL ($120k) and remaining portfolio heat budget
+        # Symbol target notionals: BTC $250k, ETH $200k, SOL $150k
+        target_notionals = {
+            "BTC-USDC-PERP": 250000.0,
+            "ETH-USDC-PERP": 200000.0,
+            "SOL-USDC-PERP": 150000.0,
+        }
+        sym_max_notional = target_notionals.get(symbol, MAX_SINGLE_TRADE_NOTIONAL)
+
         current_notional = sum(abs(p.get("notional", 0.0)) for p in self.positions.values())
         remaining_heat = max(0.0, MAX_PORTFOLIO_NOTIONAL - current_notional)
-        allowed_notional = min(MAX_SINGLE_TRADE_NOTIONAL, remaining_heat)
+        allowed_notional = min(sym_max_notional, remaining_heat)
         max_qty = allowed_notional / entry_price
         min_notional_qty = MIN_NOTIONAL_USD / entry_price
 
@@ -820,14 +817,14 @@ class QuantitativeTradingAgent:
         self, symbol: str, side: str, price: float, qty: float, atr: float, module: str = "A"
     ):
         if module == "C":
-            # Module C Funding Carry: Wide structural bounds (-2.0% SL, +1.5% TP) to hold across funding settlements
+            # Module C Funding Carry: Wide structural bounds (-2.0% SL, +2.5% TP) to hold across funding settlements
             sl = price * 1.020 if side == "SELL" else price * 0.980
-            tp = price * 0.985 if side == "SELL" else price * 1.015
+            tp = price * 0.975 if side == "SELL" else price * 1.025
         else:
             effective_atr = max(atr if not pd.isna(atr) else 0.0, price * MIN_ATR_RATIO)
-            sl = price - (1.5 * effective_atr) if side == "BUY" else price + (1.5 * effective_atr)
+            sl = price - (STOP_LOSS_ATR_MULT * effective_atr) if side == "BUY" else price + (STOP_LOSS_ATR_MULT * effective_atr)
             fee_drag = price * (self.maker_fee_pct * 2.0)
-            tp = price + (3.0 * effective_atr) + fee_drag if side == "BUY" else price - (3.0 * effective_atr) - fee_drag
+            tp = price + (TAKE_PROFIT_ATR_MULT * effective_atr) + fee_drag if side == "BUY" else price - (TAKE_PROFIT_ATR_MULT * effective_atr) - fee_drag
 
         # Fee & Funding Pre-Trade Gate:
         expected_profit = abs(tp - price) * qty
@@ -1140,9 +1137,15 @@ class QuantitativeTradingAgent:
         exit_time = self.active_exit_order_time.get(symbol, 0.0)
 
         # 0. Emergency / Protective Stop Loss (Highest Priority - Trumps resting orders)
-        # Module C Stop Loss: -2.0% hard drawdown stop
+        # Module A & C Stop Loss: -1.8% to -2.0% hard drawdown stop
         # Module B Stop Loss: -0.60% (60 bps) protective stop
-        stop_loss_pct = -0.020 if source_module == "C" else -0.0060
+        if source_module == "A":
+            stop_loss_pct = -0.018
+        elif source_module == "C":
+            stop_loss_pct = -0.020
+        else:
+            stop_loss_pct = -0.0060
+
         if pnl_pct <= stop_loss_pct:
             logger.warning(
                 f"[{symbol}] [STOP_LOSS] TRIGGERED: PnL={pnl_pct:.2%} (-${abs(unrealized_usd):,.2f}) "
@@ -1167,6 +1170,60 @@ class QuantitativeTradingAgent:
                 logger.info(
                     f"[{symbol}] Refreshing resting exit order: drift={drift:.2%}, age={int(age)}s."
                 )
+
+        # 2. Module A (Trend & Momentum Execution) Exits:
+        if source_module == "A":
+            peak_key = f"{symbol}_{side}"
+            self.position_peak_pnl[peak_key] = max(self.position_peak_pnl.get(peak_key, 0.0), pnl_pct)
+            peak_pnl = self.position_peak_pnl[peak_key]
+
+            # 2A. Trend Take Profit: +2.50% target
+            if pnl_pct >= 0.025:
+                logger.info(
+                    f"[{symbol}] [TREND_TP] Target +{pnl_pct:.2%} hit (+${unrealized_usd:,.2f})! "
+                    f"Locking in institutional profit!"
+                )
+                closed = await self.close_position(symbol, reason=f"trend_tp_+{pnl_pct:.2%}", aggressive=False)
+                if closed:
+                    return "trend_tp_closed"
+
+            # 2B. Trailing Profit Lock: If peak reached +1.20% and retraces by > 40 bps, lock in gain!
+            if peak_pnl >= 0.0120 and (peak_pnl - pnl_pct) >= 0.0040:
+                logger.info(
+                    f"[{symbol}] [TRAILING_STOP] Peak +{peak_pnl:.2%} pulled back to +{pnl_pct:.2%}. "
+                    f"Locking in +${unrealized_usd:,.2f} gain!"
+                )
+                closed = await self.close_position(symbol, reason=f"trailing_stop_+{pnl_pct:.2%}", aggressive=False)
+                if closed:
+                    return "trailing_stop_closed"
+
+            # 2C. Rest passive take-profit order at +2.5% target if not already resting
+            if not active_exit_id:
+                counter_side = "SELL" if side == "BUY" else "BUY"
+                target_price = entry * 1.025 if side == "BUY" else entry * 0.975
+                p_str = self.format_price(symbol, target_price, rounding=ROUND_UP if counter_side == "SELL" else ROUND_DOWN)
+                q_str = self.format_qty(symbol, size)
+                opts = PlaceOrderOptions(reduce_only=True, post_only=True, stp_mode="CANCEL_AGGRESSOR")
+                try:
+                    ack = await self.client.place_order(
+                        symbol=symbol,
+                        side=to_sdk_side(counter_side),
+                        order_type=OrderType.LIMIT,
+                        quantity=q_str,
+                        price=p_str,
+                        time_in_force=TimeInForce.GTC,
+                        options=opts,
+                    )
+                    oid = getattr(ack, "order_id", None) or (ack.get("order_id") if isinstance(ack, dict) else None)
+                    if getattr(ack, "success", True) and oid:
+                        self.active_exit_orders[symbol] = str(oid)
+                        self.active_exit_order_price[symbol] = float(target_price)
+                        self.active_exit_order_time[symbol] = time.time()
+                        logger.info(f"[{symbol}] [TREND_TP] Posted resting counter order {counter_side} {q_str} @ {p_str}")
+                except Exception as e:
+                    logger.debug(f"[{symbol}] Trend TP order post notice: {e}")
+
+            return f"active_trend_{side}_pnl={pnl_pct:.2%}_(+${unrealized_usd:,.2f})"
 
         # 2. Module C (Funding Carry Arbitrage) Exits:
         if source_module == "C":
@@ -1269,8 +1326,8 @@ class QuantitativeTradingAgent:
         if symbol in self.positions:
             return "has_active_position"
         await self._switch_module(symbol, "B")
-        config = REGIME_CONFIG["MEAN_REV"]
-        if self._get_active_module_count("B") > config["max_pos"]:
+        config = REGIME_CONFIG.get("MEAN_REV", {"module": "B", "weight": 0.0, "leverage": 2, "max_pos": 3})
+        if self._get_active_module_count("B") > config.get("max_pos", 3):
             return "blocked_max_pos"
         if not self._check_portfolio_heat():
             return "blocked_heat"
@@ -1767,13 +1824,13 @@ class QuantitativeTradingAgent:
 
         funding = abs(self.funding_rates.get(symbol, 0.0))
 
-        # Institutional Dual-Engine Architecture:
-        # 1. High Funding Yield (>= FUNDING_SHORT_THRESHOLD): Prioritize Carry Harvesting (Module C)
+        # Institutional Dual-Engine Architecture (v3.0.0):
+        # 1. Extreme Funding Yield (>= FUNDING_SHORT_THRESHOLD = 15 bps/hr): Prioritize Carry Harvesting (Module C)
         if funding >= FUNDING_SHORT_THRESHOLD:
             raw_regime = "FUNDING"
-        # 2. Dense Market Making with Instant Round-Turn Spread Harvesting (Module B)
+        # 2. Primary Engine: High-Conviction Directional Trend Momentum (Module A)
         else:
-            raw_regime = "MEAN_REV"
+            raw_regime = "TREND"
 
         # Apply regime stability filter to prevent rapid churn
         current_mod = self.active_modules.get(symbol)
@@ -1892,10 +1949,10 @@ class QuantitativeTradingAgent:
 
         module = config["module"]
 
-        # Institutional frequency control: enforce cooldown on carry entries to stop churn
+        # Institutional frequency control: enforce cooldown on trade entries to eliminate overtrading churn
         now_ts = time.time()
         time_since_trade = now_ts - self.last_trade_time.get(symbol, 0.0)
-        if module == "C" and time_since_trade < TRADE_COOLDOWN_SECONDS:
+        if time_since_trade < TRADE_COOLDOWN_SECONDS:
             rem_cd = int(TRADE_COOLDOWN_SECONDS - time_since_trade)
             logger.info(
                 f"[{symbol}] regime={regime} module={module} mid={mid_price:.6g} "
@@ -1903,7 +1960,9 @@ class QuantitativeTradingAgent:
             )
             return
 
-        if module == "C":
+        if module == "A":
+            result = await self.execute_trend_module(symbol, mid_price)
+        elif module == "C":
             result = await self.execute_funding_module(symbol, mid_price)
         elif module == "B":
             result = await self.execute_grid_module(symbol, mid_price)

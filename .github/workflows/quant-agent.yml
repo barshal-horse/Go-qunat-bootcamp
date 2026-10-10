@@ -3,11 +3,14 @@ name: GoDark Quant Agent (Bootcamp)
 on:
   schedule:
     - cron: '20 0,6,12,18 * * *'  # Autoruns at 00:20, 06:20, 12:20, 18:20 UTC (3m after 340m run concludes)
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 concurrency:
   group: quant-agent-singleton
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run-agent:

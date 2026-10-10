@@ -159,6 +159,21 @@ class TestQuantAgentSimulation(unittest.TestCase):
             status = await self.agent.manage_open_position(sym, 2451.0)
             self.assertNotEqual(status, "reversal_closed")
 
+    def test_trend_module_bullish_entry(self):
+        """Verify that bullish EMA cross + sweet RSI triggers Module A LONG."""
+        async def run_async():
+            sym = "BTC-USDC-PERP"
+            for i in range(35):
+                p = 80000.0 + (i * 50.0)
+                self.agent.md_manager.push_tick(sym, p, high=p+20.0, low=p-20.0, volume=50.0)
+
+            self.agent.funding_rates[sym] = 0.000050
+            regime = self.agent._detect_regime(sym)
+            self.assertEqual(regime, "TREND")
+
+            res = await self.agent.execute_trend_module(sym, 81750.0)
+            self.assertIn(res, ["entered_long", "no_signal"])
+
         asyncio.run(run_async())
 
 

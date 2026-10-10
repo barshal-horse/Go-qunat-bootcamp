@@ -1,49 +1,30 @@
 {
-  "version": "2.0.0",
-  "timestamp": "2026-10-09T18:15:00.000000Z",
-  "target_apr_pct": 30.0,
-  "daily_profit_target_usd": 822.0,
+  "version": "3.0.0",
+  "timestamp": "2026-10-10T12:00:00.000000Z",
+  "strategy": "High-Conviction Directional Trend Momentum & Strategic Carry v3.0.0",
+  "target_apr_pct": 100.0,
+  "daily_profit_target_usd": 5000.0,
   "risk_management": {
-    "risk_factor": 0.002,
-    "max_single_trade_notional": 100000.0,
-    "max_portfolio_notional": 350000.0,
+    "risk_factor": 0.010,
+    "max_single_trade_notional": 250000.0,
+    "max_portfolio_notional": 600000.0,
     "trade_cooldown_seconds": 180,
     "min_atr_ratio": 0.006,
-    "max_fee_to_profit_ratio": 0.25
+    "max_fee_to_profit_ratio": 0.15
+  },
+  "module_a_trend": {
+    "ema_fast": 20,
+    "ema_slow": 50,
+    "rsi_period": 14,
+    "adx_threshold": 15.0,
+    "target_tp_pct": 0.025,
+    "stop_loss_pct": 0.018,
+    "trailing_trigger_pct": 0.012,
+    "trailing_retrace_pct": 0.004
   },
   "module_c_funding": {
-    "funding_entry_threshold": 0.00010,
-    "funding_exit_threshold": 0.00003,
-    "target_carry_notional": 90000.0
-  },
-  "module_b_grid": {
-    "offsets_bps": {
-      "SOL-USDC-PERP": [
-        0.0016,
-        0.0032,
-        0.0055
-      ],
-      "ETH-USDC-PERP": [
-        0.0018,
-        0.0036,
-        0.0060
-      ],
-      "BTC-USDC-PERP": [
-        0.0020,
-        0.0040,
-        0.0070
-      ]
-    },
-    "inventory_skew_gamma": 0.0001,
-    "resting_drift_tolerance": 0.0025,
-    "max_resting_age_seconds": 180.0,
-    "round_turn_spread_bps": 0.0020
-  },
-  "position_management": {
-    "breakeven_atr_mult": 0.75,
-    "trailing_trigger_atr_mult": 1.25,
-    "trailing_retrace_ratio": 0.35,
-    "take_profit_atr_mult": 2.2,
-    "stop_loss_atr_mult": 1.5
+    "funding_entry_threshold": 0.00015,
+    "funding_exit_threshold": 0.00005,
+    "target_carry_notional": 200000.0
   }
 }
