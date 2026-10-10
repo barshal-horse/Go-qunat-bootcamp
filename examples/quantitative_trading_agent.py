@@ -1228,11 +1228,12 @@ class QuantitativeTradingAgent:
         # 2. Module C (Funding Carry Arbitrage) Exits:
         if source_module == "C":
             funding = self.funding_rates.get(symbol, 0.0)
+            pos_age = now_ts - self.last_trade_time.get(symbol, now_ts)
 
-            # 2A. Carry Normalization: Exit when funding drops below threshold (0.5 bps/hr = +4.4% APR)
-            if abs(funding) < FUNDING_EXIT_THRESHOLD:
+            # 2A. Carry Normalization: Exit when funding drops below threshold after holding for at least 1 hour (collected funding)
+            if pos_age >= 3600 and 0 < abs(funding) < FUNDING_EXIT_THRESHOLD:
                 logger.info(
-                    f"[{symbol}] [CARRY_HARVEST] Funding normalized ({funding:.6f} < {FUNDING_EXIT_THRESHOLD:.6f}). "
+                    f"[{symbol}] [CARRY_HARVEST] Funding normalized ({funding:.6f} < {FUNDING_EXIT_THRESHOLD:.6f}) after {int(pos_age/60)}m. "
                     f"Harvesting carry (+${unrealized_usd:,.2f})..."
                 )
                 closed = await self.close_position(symbol, reason=f"funding_normalized_{funding:.6f}", aggressive=False)
@@ -1546,11 +1547,11 @@ class QuantitativeTradingAgent:
         calc_atr = float(latest.get("atr", 0.0) or 0.0)
         atr = max(calc_atr, mid_price * MIN_ATR_RATIO)
 
-        # Exit condition: harvest profit once funding normalizes
+        # Exit condition: harvest profit once funding normalizes after holding for at least 1 hour
         if symbol in self.positions:
-            pos = self.positions[symbol]
-            if abs(funding) < FUNDING_EXIT_THRESHOLD:
-                logger.info(f"[{symbol}] Module C funding normalized ({funding:.6f} < {FUNDING_EXIT_THRESHOLD:.6f}). Closing position...")
+            pos_age = time.time() - self.last_trade_time.get(symbol, time.time())
+            if pos_age >= 3600 and 0 < abs(funding) < FUNDING_EXIT_THRESHOLD:
+                logger.info(f"[{symbol}] Module C funding normalized ({funding:.6f} < {FUNDING_EXIT_THRESHOLD:.6f}) after {int(pos_age/60)}m. Closing position...")
                 closed = await self.close_position(symbol, reason=f"funding_normalized_{funding:.6f}")
                 return "exit_placed" if closed else "order_rejected"
             return "already_positioned"
