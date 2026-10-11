@@ -2,7 +2,7 @@ name: GoDark Quant Agent (Bootcamp)
 
 on:
   schedule:
-    - cron: '20 0,6,12,18 * * *'  # Autoruns at 00:20, 06:20, 12:20, 18:20 UTC (3m after 340m run concludes)
+    - cron: '0 */5 * * *'  # Seamless 24/7 perpetual loop: triggers every 5h (00:00, 05:00, 10:00, 15:00, 20:00 UTC)
   push:
     branches:
       - main
@@ -46,7 +46,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           set -e
-          timeout 340m .venv/bin/python examples/quantitative_trading_agent.py || [ $? -eq 124 ]
+          timeout 310m .venv/bin/python examples/quantitative_trading_agent.py || [ $? -eq 124 ]
 
       - name: Upload trade logs
         if: always()
