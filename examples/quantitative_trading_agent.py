@@ -652,6 +652,14 @@ class QuantitativeTradingAgent:
         self.active_exit_order_price: Dict[str, float] = {}  # {symbol: price}
         self.active_exit_order_time: Dict[str, float] = {}  # {symbol: timestamp}
 
+        # Multi-Leg Anti-Accumulation: Pending entry order & Symbol cap tracking
+        self.pending_entry_orders: Dict[str, Tuple[str, float]] = {}  # {symbol: (order_id, timestamp)}
+        self.target_symbol_notionals: Dict[str, float] = {
+            "BTC-USDC-PERP": 250000.0,
+            "ETH-USDC-PERP": 200000.0,
+            "SOL-USDC-PERP": 150000.0,
+        }
+
     # -------------------------------------------------------------------------
     # Formatting Helpers
     # -------------------------------------------------------------------------
@@ -729,6 +737,10 @@ class QuantitativeTradingAgent:
                         self.active_exit_orders.pop(s, None)
                         self.active_exit_order_price.pop(s, None)
                         self.active_exit_order_time.pop(s, None)
+                # Clean up pending entry orders for filled positions
+                for s in list(self.pending_entry_orders.keys()):
+                    if s in new_positions:
+                        self.pending_entry_orders.pop(s, None)
         except Exception as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status == 401 and not _retried:
@@ -768,17 +780,28 @@ class QuantitativeTradingAgent:
 
         raw_qty = net_risk_budget / sl_distance
 
-        # Symbol target notionals: BTC $250k, ETH $200k, SOL $150k
-        target_notionals = {
-            "BTC-USDC-PERP": 250000.0,
-            "ETH-USDC-PERP": 200000.0,
-            "SOL-USDC-PERP": 150000.0,
-        }
-        sym_max_notional = target_notionals.get(symbol, MAX_SINGLE_TRADE_NOTIONAL)
+        # Strict Symbol Position Cap: BTC $250k, ETH $200k, SOL $150k
+        sym_max_notional = self.target_symbol_notionals.get(symbol, MAX_SINGLE_TRADE_NOTIONAL)
+        existing_pos = self.positions.get(symbol)
+        existing_sym_notional = abs(float(existing_pos.get("notional", 0.0))) if existing_pos else 0.0
+        
+        # Hard cap: if this symbol is already at or above target notional, block any further accumulation!
+        if existing_sym_notional >= sym_max_notional:
+            logger.info(
+                f"[{symbol}] Trade sizing blocked: existing position notional ${existing_sym_notional:,.2f} "
+                f">= hard cap ${sym_max_notional:,.2f}"
+            )
+            return 0.0
 
-        current_notional = sum(abs(p.get("notional", 0.0)) for p in self.positions.values())
-        remaining_heat = max(0.0, MAX_PORTFOLIO_NOTIONAL - current_notional)
-        allowed_notional = min(sym_max_notional, remaining_heat)
+        remaining_sym_notional = max(0.0, sym_max_notional - existing_sym_notional)
+        current_portfolio_notional = sum(abs(float(p.get("notional", 0.0))) for p in self.positions.values())
+        remaining_portfolio_heat = max(0.0, MAX_PORTFOLIO_NOTIONAL - current_portfolio_notional)
+        allowed_notional = min(remaining_sym_notional, remaining_portfolio_heat)
+        
+        if allowed_notional < MIN_NOTIONAL_USD:
+            logger.info(f"[{symbol}] Trade sizing blocked: allowed notional ${allowed_notional:,.2f} < min ${MIN_NOTIONAL_USD}")
+            return 0.0
+
         max_qty = allowed_notional / entry_price
         min_notional_qty = MIN_NOTIONAL_USD / entry_price
 
@@ -851,6 +874,10 @@ class QuantitativeTradingAgent:
     async def place_directional_order(
         self, symbol: str, side: str, price: float, qty: float, atr: float, module: str = "A"
     ):
+        if qty <= 0:
+            logger.info(f"[{symbol}] MODULE {module} trade blocked: calculated qty is {qty}")
+            return False
+
         if module == "C":
             # Module C Funding Carry: Wide structural bounds (-2.0% SL, +2.5% TP) to hold across funding settlements
             sl = price * 1.020 if side == "SELL" else price * 0.980
@@ -970,6 +997,8 @@ class QuantitativeTradingAgent:
 
             logger.info(f"[{symbol}] Order successfully accepted: order_id={order_id}")
             self.last_trade_time[symbol] = time.time()
+            if order_id:
+                self.pending_entry_orders[symbol] = (str(order_id), time.time())
             self.position_source_module[symbol] = module
             regime = self._detect_regime(symbol)
 
@@ -1189,6 +1218,17 @@ class QuantitativeTradingAgent:
             closed = await self.close_position(symbol, reason=f"stop_loss_{pnl_pct:.2%}", aggressive=True)
             if closed:
                 return "stop_loss_closed"
+
+        # 0B. Fast Institutional Profit Harvest (Lock in large dollar gains)
+        # If dollar profit >= $2,000.0 or PnL >= +0.35% (+35 bps), harvest immediately!
+        if unrealized_usd >= 2000.0 or pnl_pct >= 0.0035:
+            logger.info(
+                f"[{symbol}] [PROFIT_HARVEST] TRIGGERED: PnL={pnl_pct:.2%} (+${unrealized_usd:,.2f}) "
+                f"exceeds harvest threshold! Locking in cold hard profit!"
+            )
+            closed = await self.close_position(symbol, reason=f"profit_harvest_+${unrealized_usd:,.0f}", aggressive=False)
+            if closed:
+                return "profit_harvest_closed"
 
         # 1. Resting Exit Order Stability:
         # If exit order is already resting and price hasn't drifted wildly, let it rest (Zero churn!)
@@ -1512,6 +1552,18 @@ class QuantitativeTradingAgent:
         if symbol in self.positions:
             return "already_positioned"
 
+        pending_entry = self.pending_entry_orders.get(symbol)
+        if pending_entry:
+            oid, ots = pending_entry
+            if (time.time() - ots) > TRADE_COOLDOWN_SECONDS:
+                try:
+                    await self.client.cancel_order(order_id=oid, symbol=symbol)
+                except Exception:
+                    pass
+                self.pending_entry_orders.pop(symbol, None)
+            else:
+                return "already_pending_entry"
+
         df = self.md_manager.get_dataframe(symbol)
         if len(df) < 20:
             return "warming_up"
@@ -1634,6 +1686,18 @@ class QuantitativeTradingAgent:
     async def execute_breakout_module(self, symbol: str, mid_price: float):
         if symbol in self.positions:
             return "already_positioned"
+
+        pending_entry = self.pending_entry_orders.get(symbol)
+        if pending_entry:
+            oid, ots = pending_entry
+            if (time.time() - ots) > TRADE_COOLDOWN_SECONDS:
+                try:
+                    await self.client.cancel_order(order_id=oid, symbol=symbol)
+                except Exception:
+                    pass
+                self.pending_entry_orders.pop(symbol, None)
+            else:
+                return "already_pending_entry"
 
         df = self.md_manager.get_dataframe(symbol)
         if len(df) < KELTNER_PERIOD:

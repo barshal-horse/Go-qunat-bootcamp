@@ -2,11 +2,15 @@ name: GoDark Quant Agent (Bootcamp)
 
 on:
   schedule:
-    - cron: '0 */5 * * *'  # Seamless 24/7 perpetual loop: triggers every 5h (00:00, 05:00, 10:00, 15:00, 20:00 UTC)
+    - cron: '0 */3 * * *'  # Safety watchdog: triggers every 3h as secondary fallback
   push:
     branches:
       - main
   workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
 
 concurrency:
   group: quant-agent-singleton
@@ -55,3 +59,16 @@ jobs:
           name: trades-${{ github.run_id }}
           path: trades.log
           retention-days: 90
+
+      - name: Auto-chain Next Continuous Session
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Current session finished. Triggering next continuous session immediately..."
+          gh workflow run "GoDark Quant Agent (Bootcamp)" --ref main || \
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/quant-agent.yml/dispatches \
+            -d '{"ref":"main"}' || true
