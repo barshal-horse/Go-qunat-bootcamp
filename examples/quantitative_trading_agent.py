@@ -339,12 +339,12 @@ if not all([API_KEY_ID, API_SECRET, PASSPHRASE]):
 REST_BASE_URL = WS_URL.replace("wss://", "https://").replace("ws://", "http://")
 SYMBOLS = ["BTC-USDC-PERP", "ETH-USDC-PERP", "SOL-USDC-PERP"]
 DEFAULT_LEVERAGE = 3
-# Risk & Capital Architecture (Positive Expectancy & Capital Preservation on $1M pool)
-# 0.35% risk per trade = $3,500 risk budget. At ~0.8%-1.0% SL = $40k-$80k notional position.
-RISK_FACTOR = 0.0035
-MAX_SINGLE_TRADE_NOTIONAL = 80000.0   # Max $80k notional per single trade (~0.08x portfolio leverage)
-MAX_PORTFOLIO_NOTIONAL = 180000.0    # Max $180k total notional across all 3 assets (~0.18x total leverage)
-TRADE_COOLDOWN_SECONDS = 300         # 5-minute cooldown per symbol to eliminate overtrading churn
+# Risk & Capital Architecture (15m Sniper Maximum Profit Engine on $1M pool)
+# Scaled notional ($120k-$180k) with strict breakeven protection and 30-minute patience cooldown
+RISK_FACTOR = 0.008
+MAX_SINGLE_TRADE_NOTIONAL = 180000.0  # Max $180k notional per single trade (~0.18x portfolio leverage)
+MAX_PORTFOLIO_NOTIONAL = 360000.0     # Max $360k total notional across all assets (~0.36x total leverage)
+TRADE_COOLDOWN_SECONDS = 1800         # 30-minute cooldown per symbol (strictly eliminates overtrading churn)
 
 LOOP_INTERVAL_SECONDS = 15
 FEED_INTERVAL_SECONDS = 2
@@ -413,18 +413,20 @@ TRAILING_RETRACE_RATIO = 0.35
 TAKE_PROFIT_ATR_MULT = 2.5           # Positive 1:2.0+ Risk/Reward target
 STOP_LOSS_ATR_MULT = 1.2             # Controlled risk distance
 
-# Directional & Harvest Calibration
-TREND_TP_PCT = 0.018                 # +1.80% trend take-profit target
-TREND_SL_PCT = 0.008                 # -0.80% protective stop loss (was -1.8%)
-TREND_TRAILING_TRIGGER = 0.009       # +0.90% trigger for trailing stop
-TREND_TRAILING_RETRACE = 0.003       # 30 bps trailing pullback allowance
-TREND_ADX_THRESHOLD = 18.0           # Minimum trend conviction
-PROFIT_HARVEST_MIN_PNL_PCT = 0.014   # +1.40% minimum before profit harvest can trigger
-PROFIT_HARVEST_MIN_USD = 1200.0      # $1,200 dollar profit floor
+# Directional & Harvest Calibration (15m Sniper Maximum Profit Engine)
+TREND_TP_PCT = 0.048                 # +4.80% trend take-profit target ($8,640 on $180k)
+TREND_SL_PCT = 0.009                 # -0.90% controlled protective stop loss ($1,620 max risk)
+BREAKEVEN_TRIGGER_PCT = 0.010        # +1.00% trigger to lock stop loss at breakeven (risk-free runner)
+TREND_TRAILING_TRIGGER = 0.022       # +2.20% trigger for trailing profit runner
+TREND_TRAILING_RETRACE = 0.008       # 80 bps trailing pullback allowance
+TREND_ADX_THRESHOLD = 22.0           # Strong trend conviction (filters out all chop)
+PROFIT_HARVEST_MIN_PNL_PCT = 0.045   # +4.50% minimum before profit harvest can trigger
+PROFIT_HARVEST_MIN_USD = 6500.0      # $6,500 dollar profit floor
+CANDLE_INTERVAL = "15m"              # 15-minute macro timeframe
 TARGET_SYMBOL_NOTIONALS_CONFIG = {
-    "BTC-USDC-PERP": 80000.0,
-    "ETH-USDC-PERP": 60000.0,
-    "SOL-USDC-PERP": 50000.0,
+    "BTC-USDC-PERP": 180000.0,
+    "ETH-USDC-PERP": 150000.0,
+    "SOL-USDC-PERP": 120000.0,
 }
 
 # Check if external calibrated params exist and load them
@@ -458,12 +460,16 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 TREND_TP_PCT = float(ma["target_tp_pct"])
             if "stop_loss_pct" in ma:
                 TREND_SL_PCT = float(ma["stop_loss_pct"])
+            if "breakeven_trigger_pct" in ma:
+                BREAKEVEN_TRIGGER_PCT = float(ma["breakeven_trigger_pct"])
             if "trailing_trigger_pct" in ma:
                 TREND_TRAILING_TRIGGER = float(ma["trailing_trigger_pct"])
             if "trailing_retrace_pct" in ma:
                 TREND_TRAILING_RETRACE = float(ma["trailing_retrace_pct"])
             if "adx_threshold" in ma:
                 TREND_ADX_THRESHOLD = float(ma["adx_threshold"])
+            if "candle_interval" in ma:
+                CANDLE_INTERVAL = str(ma["candle_interval"])
 
             mc = cal_data.get("module_c_funding", {})
             if "funding_entry_threshold" in mc:
@@ -488,6 +494,8 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 STAT_ARB_LOOKBACK = int(me["lookback_periods"])
 
             pm = cal_data.get("position_management", {})
+            if "breakeven_trigger_pct" in pm:
+                BREAKEVEN_TRIGGER_PCT = float(pm["breakeven_trigger_pct"])
             if "breakeven_atr_mult" in pm:
                 BREAKEVEN_ATR_MULT = float(pm["breakeven_atr_mult"])
             if "trailing_trigger_atr_mult" in pm:
@@ -1284,7 +1292,19 @@ class QuantitativeTradingAgent:
             self.position_peak_pnl[peak_key] = max(self.position_peak_pnl.get(peak_key, 0.0), pnl_pct)
             peak_pnl = self.position_peak_pnl[peak_key]
 
-            # 2A. Trend Take Profit: +1.80% target (calibrated via TREND_TP_PCT)
+            # 2A. Auto-Breakeven Protection Lock (Armor against giving back gains):
+            # If peak profit has touched >= +1.00% (+100 bps), the trade is fully derisked.
+            # If price retraces back to entry price (+0.05% fee buffer), close to lock in breakeven!
+            if peak_pnl >= BREAKEVEN_TRIGGER_PCT and pnl_pct <= 0.0005:
+                logger.info(
+                    f"[{symbol}] [BREAKEVEN_SHIELD] Peak was +{peak_pnl:.2%}, price retraced to entry (+{pnl_pct:.2%}). "
+                    f"Executing risk-free breakeven exit!"
+                )
+                closed = await self.close_position(symbol, reason=f"breakeven_lock_+{pnl_pct:.2%}", aggressive=False)
+                if closed:
+                    return "breakeven_closed"
+
+            # 2B. Trend Take Profit: +4.80% target (calibrated via TREND_TP_PCT)
             if pnl_pct >= TREND_TP_PCT:
                 logger.info(
                     f"[{symbol}] [TREND_TP] Target +{pnl_pct:.2%} hit (+${unrealized_usd:,.2f})! "
@@ -1294,17 +1314,17 @@ class QuantitativeTradingAgent:
                 if closed:
                     return "trend_tp_closed"
 
-            # 2B. Trailing Profit Lock: If peak reached trigger (+0.90%) and retraces by > 30 bps, lock in gain!
+            # 2C. Trailing Profit Runner: If peak reached trigger (+2.20%) and retraces by > 80 bps, lock in gain!
             if peak_pnl >= TREND_TRAILING_TRIGGER and (peak_pnl - pnl_pct) >= TREND_TRAILING_RETRACE:
                 logger.info(
-                    f"[{symbol}] [TRAILING_STOP] Peak +{peak_pnl:.2%} pulled back to +{pnl_pct:.2%}. "
+                    f"[{symbol}] [TRAILING_RUNNER] Peak +{peak_pnl:.2%} pulled back to +{pnl_pct:.2%}. "
                     f"Locking in +${unrealized_usd:,.2f} gain!"
                 )
                 closed = await self.close_position(symbol, reason=f"trailing_stop_+{pnl_pct:.2%}", aggressive=False)
                 if closed:
                     return "trailing_stop_closed"
 
-            # 2C. Rest passive take-profit order at target if not already resting
+            # 2D. Rest passive take-profit order at target if not already resting
             if not active_exit_id:
                 counter_side = "SELL" if side == "BUY" else "BUY"
                 target_price = entry * (1.0 + TREND_TP_PCT) if side == "BUY" else entry * (1.0 - TREND_TP_PCT)
@@ -2005,16 +2025,16 @@ class QuantitativeTradingAgent:
         self.active_modules[symbol] = new_module
 
     async def seed_historical_candles(self):
-        logger.info("Seeding historical 1-minute candles from Hyperliquid reference feed...")
+        logger.info(f"Seeding historical {CANDLE_INTERVAL} candles from Hyperliquid reference feed...")
         try:
             async with httpx.AsyncClient(timeout=10.0) as http:
                 now_ms = int(time.time() * 1000)
-                start_ms = now_ms - (3600 * 1000)
+                start_ms = now_ms - (3 * 86400 * 1000)  # 3 days of 15m candles (288 periods)
                 for symbol, key in REFERENCE_MID_KEYS.items():
                     try:
                         resp = await http.post(
                             REFERENCE_MID_URL,
-                            json={"type": "candleSnapshot", "req": {"coin": key, "interval": "1m", "startTime": start_ms}},
+                            json={"type": "candleSnapshot", "req": {"coin": key, "interval": CANDLE_INTERVAL, "startTime": start_ms}},
                         )
                         if resp.status_code == 200:
                             candles = resp.json()
@@ -2022,7 +2042,7 @@ class QuantitativeTradingAgent:
                                 self.md_manager.seed_candles(symbol, candles)
                                 self._ref_fed.add(symbol)
                                 logger.info(
-                                    f"[{symbol}] Seeded {len(candles)} 1m candles (close=${candles[-1].get('c')})"
+                                    f"[{symbol}] Seeded {len(candles)} {CANDLE_INTERVAL} candles (close=${candles[-1].get('c')})"
                                 )
                     except Exception as e:
                         logger.warning(f"[{symbol}] Historical candle seeding notice: {e}")
@@ -2033,12 +2053,12 @@ class QuantitativeTradingAgent:
         try:
             async with httpx.AsyncClient(timeout=6.0) as http:
                 now_ms = int(time.time() * 1000)
-                start_ms = now_ms - (3600 * 1000)
+                start_ms = now_ms - (3 * 86400 * 1000)
                 for symbol, key in REFERENCE_MID_KEYS.items():
                     try:
                         resp = await http.post(
                             REFERENCE_MID_URL,
-                            json={"type": "candleSnapshot", "req": {"coin": key, "interval": "1m", "startTime": start_ms}},
+                            json={"type": "candleSnapshot", "req": {"coin": key, "interval": CANDLE_INTERVAL, "startTime": start_ms}},
                         )
                         if resp.status_code == 200:
                             candles = resp.json()

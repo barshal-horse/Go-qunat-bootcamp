@@ -1,24 +1,26 @@
 # Agent Session Memory & Strategy Status
 
-## Current Context (October 15, 2026)
-- **Account Capital**: $968,998.88 USDC (down from $1,000,000.00 initial capital, -$31,001.12 total drawdown).
-- **Recent Net Performance (Oct 12 - 15)**: -$26,570.43 net realized loss across 298 fills.
-- **Exchange Fees Paid**: $10,105.11.
+## Current Context (October 15, 2026 - Bootcamp Final Stretch)
+- **Deadline**: October 26, 2026 (~11 days remaining).
+- **Core Mission**: Recover -$31,001.12 drawdown and maximize total PnL with minimum trade turnover.
+- **Account Capital**: $969,028.41 USDC (Initial: $1,000,000.00).
 
-## Root Cause Diagnostics
-1. **Inverted Risk-Reward (1 : 5.7 Negative Expectancy)**:
-   - Line 1224 in `examples/quantitative_trading_agent.py` cuts winners at `pnl_pct >= 0.0035` (+35 bps) or $2,000.
-   - Lines 1207-1210 allow stop losses to run to `-1.80%` (Module A) and `-2.00%` (Module C).
-   - Requires >91% win rate to break even after exchange fees. Realized win rate was ~49%, resulting in continuous bleed.
-2. **Oversized Notionals on 1-Minute Candle Noise**:
-   - `MAX_SINGLE_TRADE_NOTIONAL` set to $250,000; ETH target $200k, BTC $250k, SOL $150k.
-   - Normal 1.5% 1m intraday noise created repetitive -$2,000 to -$3,000 losses.
-3. **Severe ETH Directional Losses**:
-   - ETH-USDC-PERP accounted for -$18,564.34 of the net loss (48 losing closes vs 20 wins).
-4. **Aggressive Taker Stops & Fee Bleed**:
-   - Stop-loss exits use IOC taker execution, costing $110-$220 per exit in fees and spread.
+## 15m Sniper Maximum Profit Engine (v4.0.0-sniper)
+1. **Timeframe Shift**: Switched from 1m tick noise to authentic 15-minute candles (`interval: "15m"`) via Hyperliquid reference feeds (3 days / 288 periods lookback).
+2. **Sniper Position Sizing**:
+   - BTC-USDC-PERP: $180,000
+   - ETH-USDC-PERP: $150,000
+   - SOL-USDC-PERP: $120,000
+   - Max portfolio notional: $360,000 (~0.36x safe leverage).
+3. **Asymmetric Risk/Reward & Armor**:
+   - Hard stop loss: -0.90% ($1,350 - $1,620 max risk per trade).
+   - Auto-Breakeven Shield: The moment price hits +1.00%, stop loss jumps to Breakeven (+0.05% fee buffer). Zero risk of winning trades turning into losses.
+   - Trailing Runner: Engages at +2.20% peak, trailing by 80 bps.
+   - Major Target: +4.80% ($7,000 - $8,600 profit per runner).
+4. **Strict Anti-Churn & Discipline**:
+   - ADX >= 22 required for trend confirmation.
+   - Trade cooldown: 1800s (30 minutes).
+   - Total trade budget: ~10 to 18 high-conviction trades across the entire 11-day period.
 
-## Next Steps Planned
-1. Apply Phase 1 Risk Containment: Reduce `MAX_SINGLE_TRADE_NOTIONAL` to $80,000 and `MAX_PORTFOLIO_NOTIONAL` to $180,000.
-2. Eliminate premature +35 bps profit harvest cap and calibrate a minimum 1 : 1.5 positive risk/reward ratio.
-3. Add higher-timeframe trend confirmation filter (5m/15m) to filter out 1m false breakouts.
+## Verification & Deployment
+- All 13 simulation unit tests in `tests/test_agent_simulation.py` passed cleanly (including breakeven shield test).

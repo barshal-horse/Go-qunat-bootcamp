@@ -1,41 +1,44 @@
 {
-  "version": "3.1.0",
-  "timestamp": "2026-10-15T00:40:00.000000Z",
-  "strategy": "High-Conviction Directional Trend Momentum & Strategic Carry v3.1.0 (Positive Expectancy & Capital Preservation)",
-  "target_apr_pct": 50.0,
-  "daily_profit_target_usd": 2500.0,
+  "version": "4.0.0-sniper",
+  "timestamp": "2026-10-15T01:00:00.000000Z",
+  "strategy": "High-Conviction 15m Trend Expansion & Uncapped Trailing Runner Engine v4.0.0 (Bootcamp Final Stretch)",
+  "target_apr_pct": 120.0,
+  "daily_profit_target_usd": 5000.0,
   "risk_management": {
-    "risk_factor": 0.0035,
-    "max_single_trade_notional": 80000.0,
-    "max_portfolio_notional": 180000.0,
-    "trade_cooldown_seconds": 300,
+    "risk_factor": 0.008,
+    "max_single_trade_notional": 180000.0,
+    "max_portfolio_notional": 360000.0,
+    "trade_cooldown_seconds": 1800,
     "min_atr_ratio": 0.006,
     "max_fee_to_profit_ratio": 0.15
   },
   "target_symbol_notionals": {
-    "BTC-USDC-PERP": 80000.0,
-    "ETH-USDC-PERP": 60000.0,
-    "SOL-USDC-PERP": 50000.0
+    "BTC-USDC-PERP": 180000.0,
+    "ETH-USDC-PERP": 150000.0,
+    "SOL-USDC-PERP": 120000.0
   },
   "module_a_trend": {
+    "candle_interval": "15m",
     "ema_fast": 20,
     "ema_slow": 50,
     "rsi_period": 14,
-    "adx_threshold": 18.0,
-    "target_tp_pct": 0.018,
-    "stop_loss_pct": 0.008,
-    "trailing_trigger_pct": 0.009,
-    "trailing_retrace_pct": 0.003
+    "adx_threshold": 22.0,
+    "target_tp_pct": 0.048,
+    "stop_loss_pct": 0.009,
+    "breakeven_trigger_pct": 0.010,
+    "trailing_trigger_pct": 0.022,
+    "trailing_retrace_pct": 0.008
   },
   "module_c_funding": {
     "funding_entry_threshold": 0.00015,
-    "funding_exit_threshold": 0.00005,
-    "target_carry_notional": 40000.0
+    "funding_exit_threshold": 0.00008,
+    "target_carry_notional": 50000.0
   },
   "position_management": {
-    "take_profit_atr_mult": 2.5,
+    "breakeven_trigger_pct": 0.010,
+    "take_profit_atr_mult": 3.5,
     "stop_loss_atr_mult": 1.2,
-    "profit_harvest_min_pnl_pct": 0.014,
-    "profit_harvest_min_usd": 1200.0
+    "profit_harvest_min_pnl_pct": 0.045,
+    "profit_harvest_min_usd": 6500.0
   }
 }

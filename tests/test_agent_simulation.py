@@ -211,17 +211,40 @@ class TestQuantAgentSimulation(unittest.TestCase):
     def test_positive_risk_reward_configuration(self):
         """Verify that risk parameters maintain positive risk-reward ratio."""
         self.assertLessEqual(qta.TREND_SL_PCT, 0.010)
-        self.assertGreaterEqual(qta.TREND_TP_PCT, 0.015)
-        self.assertGreater(qta.TREND_TP_PCT / qta.TREND_SL_PCT, 1.5)
-        self.assertLessEqual(qta.MAX_SINGLE_TRADE_NOTIONAL, 100000.0)
-        self.assertLessEqual(qta.MAX_PORTFOLIO_NOTIONAL, 200000.0)
+        self.assertGreaterEqual(qta.TREND_TP_PCT, 0.040)
+        self.assertGreater(qta.TREND_TP_PCT / qta.TREND_SL_PCT, 3.0)
+        self.assertLessEqual(qta.MAX_SINGLE_TRADE_NOTIONAL, 200000.0)
+        self.assertLessEqual(qta.MAX_PORTFOLIO_NOTIONAL, 400000.0)
 
     def test_calibrated_symbol_notionals(self):
         """Verify that target symbol notionals are properly constrained."""
         notionals = self.agent.target_symbol_notionals
-        self.assertEqual(notionals.get("BTC-USDC-PERP"), 80000.0)
-        self.assertEqual(notionals.get("ETH-USDC-PERP"), 60000.0)
-        self.assertEqual(notionals.get("SOL-USDC-PERP"), 50000.0)
+        self.assertEqual(notionals.get("BTC-USDC-PERP"), 180000.0)
+        self.assertEqual(notionals.get("ETH-USDC-PERP"), 150000.0)
+        self.assertEqual(notionals.get("SOL-USDC-PERP"), 120000.0)
+
+    def test_breakeven_shield_lock(self):
+        """Verify that positions which peak at >= +1.0% lock in breakeven when retracing."""
+        async def run_async():
+            sym = "ETH-USDC-PERP"
+            self.agent.positions[sym] = {
+                "symbol": sym,
+                "size": 50.0,
+                "notional": 120000.0,
+                "entry_price": 2400.0,
+                "side": "BUY",
+            }
+            self.agent.position_source_module[sym] = "A"
+            self.agent.md_manager.current_mids[sym] = 2400.5
+            
+            # Simulate that position had previously reached +1.20% peak gain
+            self.agent.position_peak_pnl[f"{sym}_BUY"] = 0.012
+
+            # Now price pulls back to 2400.5 (+0.02% gain, near entry)
+            status = await self.agent.manage_open_position(sym, 2400.5)
+            self.assertEqual(status, "breakeven_closed")
+
+        asyncio.run(run_async())
 
 
 if __name__ == "__main__":
