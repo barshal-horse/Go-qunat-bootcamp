@@ -2,7 +2,7 @@ name: GoDark Quant Agent (Bootcamp)
 
 on:
   schedule:
-    - cron: '0 */3 * * *'  # Safety watchdog: triggers every 3h as secondary fallback
+    - cron: '0 */6 * * *'  # Safety watchdog: triggers every 6h as secondary fallback (prevents mid-flight collisions)
   push:
     branches:
       - main
@@ -61,7 +61,7 @@ jobs:
           retention-days: 90
 
       - name: Auto-chain Next Continuous Session
-        if: always()
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
