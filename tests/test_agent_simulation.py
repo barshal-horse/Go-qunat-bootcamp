@@ -208,6 +208,21 @@ class TestQuantAgentSimulation(unittest.TestCase):
 
         asyncio.run(run_async())
 
+    def test_positive_risk_reward_configuration(self):
+        """Verify that risk parameters maintain positive risk-reward ratio."""
+        self.assertLessEqual(qta.TREND_SL_PCT, 0.010)
+        self.assertGreaterEqual(qta.TREND_TP_PCT, 0.015)
+        self.assertGreater(qta.TREND_TP_PCT / qta.TREND_SL_PCT, 1.5)
+        self.assertLessEqual(qta.MAX_SINGLE_TRADE_NOTIONAL, 100000.0)
+        self.assertLessEqual(qta.MAX_PORTFOLIO_NOTIONAL, 200000.0)
+
+    def test_calibrated_symbol_notionals(self):
+        """Verify that target symbol notionals are properly constrained."""
+        notionals = self.agent.target_symbol_notionals
+        self.assertEqual(notionals.get("BTC-USDC-PERP"), 80000.0)
+        self.assertEqual(notionals.get("ETH-USDC-PERP"), 60000.0)
+        self.assertEqual(notionals.get("SOL-USDC-PERP"), 50000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

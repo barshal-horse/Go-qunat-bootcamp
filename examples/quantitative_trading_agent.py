@@ -339,12 +339,12 @@ if not all([API_KEY_ID, API_SECRET, PASSPHRASE]):
 REST_BASE_URL = WS_URL.replace("wss://", "https://").replace("ws://", "http://")
 SYMBOLS = ["BTC-USDC-PERP", "ETH-USDC-PERP", "SOL-USDC-PERP"]
 DEFAULT_LEVERAGE = 3
-# Risk & Capital Architecture (Scaled for Bootcamp Aggressive Growth on $1M pool)
-# 1.00% risk per trade = $10,000 risk budget. At ~1.5%-1.8% SL = $150k-$250k notional position.
-RISK_FACTOR = 0.010
-MAX_SINGLE_TRADE_NOTIONAL = 250000.0  # Max $250k notional per single trade (~0.25x portfolio leverage)
-MAX_PORTFOLIO_NOTIONAL = 600000.0     # Max $600k total notional across all 3 assets (~0.60x total leverage)
-TRADE_COOLDOWN_SECONDS = 180          # 3-minute cooldown per symbol
+# Risk & Capital Architecture (Positive Expectancy & Capital Preservation on $1M pool)
+# 0.35% risk per trade = $3,500 risk budget. At ~0.8%-1.0% SL = $40k-$80k notional position.
+RISK_FACTOR = 0.0035
+MAX_SINGLE_TRADE_NOTIONAL = 80000.0   # Max $80k notional per single trade (~0.08x portfolio leverage)
+MAX_PORTFOLIO_NOTIONAL = 180000.0    # Max $180k total notional across all 3 assets (~0.18x total leverage)
+TRADE_COOLDOWN_SECONDS = 300         # 5-minute cooldown per symbol to eliminate overtrading churn
 
 LOOP_INTERVAL_SECONDS = 15
 FEED_INTERVAL_SECONDS = 2
@@ -410,8 +410,22 @@ MAX_RESTING_AGE_SECONDS = 300.0    # 5 minutes maximum resting order age before 
 BREAKEVEN_ATR_MULT = 1.0
 TRAILING_TRIGGER_ATR_MULT = 1.5
 TRAILING_RETRACE_RATIO = 0.35
-TAKE_PROFIT_ATR_MULT = 3.0
-STOP_LOSS_ATR_MULT = 1.8
+TAKE_PROFIT_ATR_MULT = 2.5           # Positive 1:2.0+ Risk/Reward target
+STOP_LOSS_ATR_MULT = 1.2             # Controlled risk distance
+
+# Directional & Harvest Calibration
+TREND_TP_PCT = 0.018                 # +1.80% trend take-profit target
+TREND_SL_PCT = 0.008                 # -0.80% protective stop loss (was -1.8%)
+TREND_TRAILING_TRIGGER = 0.009       # +0.90% trigger for trailing stop
+TREND_TRAILING_RETRACE = 0.003       # 30 bps trailing pullback allowance
+TREND_ADX_THRESHOLD = 18.0           # Minimum trend conviction
+PROFIT_HARVEST_MIN_PNL_PCT = 0.014   # +1.40% minimum before profit harvest can trigger
+PROFIT_HARVEST_MIN_USD = 1200.0      # $1,200 dollar profit floor
+TARGET_SYMBOL_NOTIONALS_CONFIG = {
+    "BTC-USDC-PERP": 80000.0,
+    "ETH-USDC-PERP": 60000.0,
+    "SOL-USDC-PERP": 50000.0,
+}
 
 # Check if external calibrated params exist and load them
 CALIBRATED_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "calibrated_params.json")
@@ -434,6 +448,22 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 MIN_ATR_RATIO = float(rm["min_atr_ratio"])
             if "max_fee_to_profit_ratio" in rm:
                 MAX_FEE_TO_PROFIT_RATIO = float(rm["max_fee_to_profit_ratio"])
+
+            if "target_symbol_notionals" in cal_data:
+                for sym_k, notional_v in cal_data["target_symbol_notionals"].items():
+                    TARGET_SYMBOL_NOTIONALS_CONFIG[sym_k] = float(notional_v)
+
+            ma = cal_data.get("module_a_trend", {})
+            if "target_tp_pct" in ma:
+                TREND_TP_PCT = float(ma["target_tp_pct"])
+            if "stop_loss_pct" in ma:
+                TREND_SL_PCT = float(ma["stop_loss_pct"])
+            if "trailing_trigger_pct" in ma:
+                TREND_TRAILING_TRIGGER = float(ma["trailing_trigger_pct"])
+            if "trailing_retrace_pct" in ma:
+                TREND_TRAILING_RETRACE = float(ma["trailing_retrace_pct"])
+            if "adx_threshold" in ma:
+                TREND_ADX_THRESHOLD = float(ma["adx_threshold"])
 
             mc = cal_data.get("module_c_funding", {})
             if "funding_entry_threshold" in mc:
@@ -468,6 +498,10 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 TAKE_PROFIT_ATR_MULT = float(pm["take_profit_atr_mult"])
             if "stop_loss_atr_mult" in pm:
                 STOP_LOSS_ATR_MULT = float(pm["stop_loss_atr_mult"])
+            if "profit_harvest_min_pnl_pct" in pm:
+                PROFIT_HARVEST_MIN_PNL_PCT = float(pm["profit_harvest_min_pnl_pct"])
+            if "profit_harvest_min_usd" in pm:
+                PROFIT_HARVEST_MIN_USD = float(pm["profit_harvest_min_usd"])
             logger.info("Loaded external calibrated parameters from config/calibrated_params.json")
     except Exception as e:
         logger.warning(f"Could not load calibrated parameters: {e}")
@@ -654,11 +688,7 @@ class QuantitativeTradingAgent:
 
         # Multi-Leg Anti-Accumulation: Pending entry order & Symbol cap tracking
         self.pending_entry_orders: Dict[str, Tuple[str, float]] = {}  # {symbol: (order_id, timestamp)}
-        self.target_symbol_notionals: Dict[str, float] = {
-            "BTC-USDC-PERP": 250000.0,
-            "ETH-USDC-PERP": 200000.0,
-            "SOL-USDC-PERP": 150000.0,
-        }
+        self.target_symbol_notionals: Dict[str, float] = dict(TARGET_SYMBOL_NOTIONALS_CONFIG)
 
     # -------------------------------------------------------------------------
     # Formatting Helpers
@@ -879,9 +909,9 @@ class QuantitativeTradingAgent:
             return False
 
         if module == "C":
-            # Module C Funding Carry: Wide structural bounds (-2.0% SL, +2.5% TP) to hold across funding settlements
-            sl = price * 1.020 if side == "SELL" else price * 0.980
-            tp = price * 0.975 if side == "SELL" else price * 1.025
+            # Module C Funding Carry: Controlled structural bounds (-1.0% SL, +1.5% TP) to prevent unhedged principal bleed
+            sl = price * 1.010 if side == "SELL" else price * 0.990
+            tp = price * 0.985 if side == "SELL" else price * 1.015
         else:
             effective_atr = max(atr if not pd.isna(atr) else 0.0, price * MIN_ATR_RATIO)
             sl = price - (STOP_LOSS_ATR_MULT * effective_atr) if side == "BUY" else price + (STOP_LOSS_ATR_MULT * effective_atr)
@@ -1201,12 +1231,13 @@ class QuantitativeTradingAgent:
         exit_time = self.active_exit_order_time.get(symbol, 0.0)
 
         # 0. Emergency / Protective Stop Loss (Highest Priority - Trumps resting orders)
-        # Module A & C Stop Loss: -1.8% to -2.0% hard drawdown stop
+        # Module A Stop Loss: -0.80% (80 bps) controlled protective stop (calibrated via TREND_SL_PCT)
+        # Module C Stop Loss: -1.00% (100 bps) protective stop
         # Module B Stop Loss: -0.60% (60 bps) protective stop
         if source_module == "A":
-            stop_loss_pct = -0.018
+            stop_loss_pct = -TREND_SL_PCT
         elif source_module == "C":
-            stop_loss_pct = -0.020
+            stop_loss_pct = -0.010
         else:
             stop_loss_pct = -0.0060
 
@@ -1219,9 +1250,10 @@ class QuantitativeTradingAgent:
             if closed:
                 return "stop_loss_closed"
 
-        # 0B. Fast Institutional Profit Harvest (Lock in large dollar gains)
-        # If dollar profit >= $2,000.0 or PnL >= +0.35% (+35 bps), harvest immediately!
-        if unrealized_usd >= 2000.0 or pnl_pct >= 0.0035:
+        # 0B. Fast Institutional Profit Harvest (Positive Expectancy Guard)
+        # Harvest only when gain is substantial (>= +1.4% or >= $1,200) to ensure positive 1:1.75+ risk-reward.
+        # This eliminates the fatal 1:5.7 asymmetry where winners were clipped at +35 bps.
+        if unrealized_usd >= PROFIT_HARVEST_MIN_USD or pnl_pct >= PROFIT_HARVEST_MIN_PNL_PCT:
             logger.info(
                 f"[{symbol}] [PROFIT_HARVEST] TRIGGERED: PnL={pnl_pct:.2%} (+${unrealized_usd:,.2f}) "
                 f"exceeds harvest threshold! Locking in cold hard profit!"
@@ -1252,8 +1284,8 @@ class QuantitativeTradingAgent:
             self.position_peak_pnl[peak_key] = max(self.position_peak_pnl.get(peak_key, 0.0), pnl_pct)
             peak_pnl = self.position_peak_pnl[peak_key]
 
-            # 2A. Trend Take Profit: +2.50% target
-            if pnl_pct >= 0.025:
+            # 2A. Trend Take Profit: +1.80% target (calibrated via TREND_TP_PCT)
+            if pnl_pct >= TREND_TP_PCT:
                 logger.info(
                     f"[{symbol}] [TREND_TP] Target +{pnl_pct:.2%} hit (+${unrealized_usd:,.2f})! "
                     f"Locking in institutional profit!"
@@ -1262,8 +1294,8 @@ class QuantitativeTradingAgent:
                 if closed:
                     return "trend_tp_closed"
 
-            # 2B. Trailing Profit Lock: If peak reached +1.20% and retraces by > 40 bps, lock in gain!
-            if peak_pnl >= 0.0120 and (peak_pnl - pnl_pct) >= 0.0040:
+            # 2B. Trailing Profit Lock: If peak reached trigger (+0.90%) and retraces by > 30 bps, lock in gain!
+            if peak_pnl >= TREND_TRAILING_TRIGGER and (peak_pnl - pnl_pct) >= TREND_TRAILING_RETRACE:
                 logger.info(
                     f"[{symbol}] [TRAILING_STOP] Peak +{peak_pnl:.2%} pulled back to +{pnl_pct:.2%}. "
                     f"Locking in +${unrealized_usd:,.2f} gain!"
@@ -1272,10 +1304,10 @@ class QuantitativeTradingAgent:
                 if closed:
                     return "trailing_stop_closed"
 
-            # 2C. Rest passive take-profit order at +2.5% target if not already resting
+            # 2C. Rest passive take-profit order at target if not already resting
             if not active_exit_id:
                 counter_side = "SELL" if side == "BUY" else "BUY"
-                target_price = entry * 1.025 if side == "BUY" else entry * 0.975
+                target_price = entry * (1.0 + TREND_TP_PCT) if side == "BUY" else entry * (1.0 - TREND_TP_PCT)
                 p_str = self.format_price(symbol, target_price, rounding=ROUND_UP if counter_side == "SELL" else ROUND_DOWN)
                 q_str = self.format_qty(symbol, size)
                 opts = PlaceOrderOptions(reduce_only=True, post_only=True, stp_mode="CANCEL_AGGRESSOR")
@@ -1315,8 +1347,8 @@ class QuantitativeTradingAgent:
                 if closed:
                     return "carry_normalized_closed"
 
-            # 2B. Capital Gain Take Profit: +1.5% target
-            if pnl_pct >= 0.015:
+            # 2B. Capital Gain Take Profit: +1.20% target (positive 1:1.20+ R:R)
+            if pnl_pct >= 0.012:
                 logger.info(
                     f"[{symbol}] [CARRY_TP] Capital gain target +{pnl_pct:.2%} hit (+${unrealized_usd:,.2f}). "
                     f"Locking in profit!"
@@ -1582,8 +1614,8 @@ class QuantitativeTradingAgent:
         adx = float(latest.get("adx", 0.0) or 0.0)
         funding = self.funding_rates.get(symbol, 0.0)
 
-        # Trend Confirmation: Allow trends when ADX >= 14.0 (captures real intraday directional expansions)
-        if adx < 14.0:
+        # Trend Confirmation: Allow trends when ADX >= TREND_ADX_THRESHOLD (filters out choppy false breakouts)
+        if adx < TREND_ADX_THRESHOLD:
             return "low_adx"
 
         # EMA Separation Buffer: 0.05x real_atr (eliminates micro-touches while capturing real trend legs)
