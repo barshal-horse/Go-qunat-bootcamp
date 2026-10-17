@@ -415,14 +415,28 @@ STOP_LOSS_ATR_MULT = 1.2             # Controlled risk distance
 
 # Directional & Harvest Calibration (15m Sniper Maximum Profit Engine)
 TREND_TP_PCT = 0.048                 # +4.80% trend take-profit target ($8,640 on $180k)
-TREND_SL_PCT = 0.009                 # -0.90% controlled protective stop loss ($1,620 max risk)
-BREAKEVEN_TRIGGER_PCT = 0.010        # +1.00% trigger to lock stop loss at breakeven (risk-free runner)
+TREND_SL_PCT = 0.0085                # -0.85% controlled protective stop loss
+BREAKEVEN_TRIGGER_PCT = 0.0090       # +0.90% trigger to lock stop loss at breakeven (risk-free runner)
 TREND_TRAILING_TRIGGER = 0.022       # +2.20% trigger for trailing profit runner
 TREND_TRAILING_RETRACE = 0.008       # 80 bps trailing pullback allowance
-TREND_ADX_THRESHOLD = 22.0           # Strong trend conviction (filters out all chop)
+TREND_ADX_THRESHOLD = 26.0           # Strong trend conviction (filters out all chop)
 PROFIT_HARVEST_MIN_PNL_PCT = 0.045   # +4.50% minimum before profit harvest can trigger
 PROFIT_HARVEST_MIN_USD = 6500.0      # $6,500 dollar profit floor
-CANDLE_INTERVAL = "15m"              # 15-minute macro timeframe
+CANDLE_INTERVAL = "15m"              # 15-minute execution timeframe
+MACRO_CANDLE_INTERVAL = "1h"          # 1-hour macro anchor timeframe
+STOP_LOSS_QUARANTINE_SECONDS = 7200   # 2-hour quarantine on symbol post stop-loss
+MIN_CONFIDENCE_SCORE = 75.0           # Min confidence score required to trade
+HIGH_CONFIDENCE_SCORE = 85.0          # High-confidence threshold for max notional sizing
+STANDARD_SYMBOL_NOTIONALS = {
+    "BTC-USDC-PERP": 160000.0,
+    "ETH-USDC-PERP": 130000.0,
+    "SOL-USDC-PERP": 100000.0,
+}
+HIGH_CONFIDENCE_SYMBOL_NOTIONALS = {
+    "BTC-USDC-PERP": 240000.0,
+    "ETH-USDC-PERP": 200000.0,
+    "SOL-USDC-PERP": 150000.0,
+}
 TARGET_SYMBOL_NOTIONALS_CONFIG = {
     "BTC-USDC-PERP": 180000.0,
     "ETH-USDC-PERP": 150000.0,
@@ -446,10 +460,24 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 MAX_PORTFOLIO_NOTIONAL = float(rm["max_portfolio_notional"])
             if "trade_cooldown_seconds" in rm:
                 TRADE_COOLDOWN_SECONDS = int(rm["trade_cooldown_seconds"])
+            if "stop_loss_quarantine_seconds" in rm:
+                STOP_LOSS_QUARANTINE_SECONDS = int(rm["stop_loss_quarantine_seconds"])
             if "min_atr_ratio" in rm:
                 MIN_ATR_RATIO = float(rm["min_atr_ratio"])
             if "max_fee_to_profit_ratio" in rm:
                 MAX_FEE_TO_PROFIT_RATIO = float(rm["max_fee_to_profit_ratio"])
+
+            ce = cal_data.get("confidence_engine", {})
+            if "min_confidence_score" in ce:
+                MIN_CONFIDENCE_SCORE = float(ce["min_confidence_score"])
+            if "high_confidence_score" in ce:
+                HIGH_CONFIDENCE_SCORE = float(ce["high_confidence_score"])
+            if "standard_symbol_notionals" in ce:
+                for sym_k, notional_v in ce["standard_symbol_notionals"].items():
+                    STANDARD_SYMBOL_NOTIONALS[sym_k] = float(notional_v)
+            if "high_confidence_symbol_notionals" in ce:
+                for sym_k, notional_v in ce["high_confidence_symbol_notionals"].items():
+                    HIGH_CONFIDENCE_SYMBOL_NOTIONALS[sym_k] = float(notional_v)
 
             if "target_symbol_notionals" in cal_data:
                 for sym_k, notional_v in cal_data["target_symbol_notionals"].items():
@@ -470,6 +498,8 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 TREND_ADX_THRESHOLD = float(ma["adx_threshold"])
             if "candle_interval" in ma:
                 CANDLE_INTERVAL = str(ma["candle_interval"])
+            if "macro_candle_interval" in ma:
+                MACRO_CANDLE_INTERVAL = str(ma["macro_candle_interval"])
 
             mc = cal_data.get("module_c_funding", {})
             if "funding_entry_threshold" in mc:
@@ -582,6 +612,7 @@ class MarketDataManager:
     def __init__(self, symbols: List[str]):
         self.symbols = symbols
         self.price_history: Dict[str, List[Dict[str, float]]] = {s: [] for s in symbols}
+        self.macro_history: Dict[str, List[Dict[str, float]]] = {s: [] for s in symbols}
         self.current_mids: Dict[str, float] = {}
 
     def push_tick(
@@ -625,6 +656,25 @@ class MarketDataManager:
             self.price_history[symbol] = records[-300:]
             self.current_mids[symbol] = records[-1]["close"]
 
+    def seed_macro_candles(self, symbol: str, candles: List[Dict[str, Any]]):
+        if not candles:
+            return
+        records = []
+        for c in candles:
+            close = float(c.get("c", c.get("close", 0.0)))
+            high = float(c.get("h", c.get("high", close)))
+            low = float(c.get("l", c.get("low", close)))
+            volume = float(c.get("v", c.get("volume", 0.0)))
+            if close > 0:
+                records.append({
+                    "close": close,
+                    "high": high,
+                    "low": low,
+                    "volume": volume,
+                })
+        if records:
+            self.macro_history[symbol] = records[-400:]
+
     def update_live_mid(self, symbol: str, price: float):
         if not price or price <= 0:
             return
@@ -641,6 +691,12 @@ class MarketDataManager:
 
     def get_dataframe(self, symbol: str) -> pd.DataFrame:
         data = self.price_history.get(symbol, [])
+        if not data:
+            return pd.DataFrame(columns=["close", "high", "low", "volume"])
+        return pd.DataFrame(data)
+
+    def get_macro_dataframe(self, symbol: str) -> pd.DataFrame:
+        data = self.macro_history.get(symbol, [])
         if not data:
             return pd.DataFrame(columns=["close", "high", "low", "volume"])
         return pd.DataFrame(data)
@@ -697,6 +753,8 @@ class QuantitativeTradingAgent:
         # Multi-Leg Anti-Accumulation: Pending entry order & Symbol cap tracking
         self.pending_entry_orders: Dict[str, Tuple[str, float]] = {}  # {symbol: (order_id, timestamp)}
         self.target_symbol_notionals: Dict[str, float] = dict(TARGET_SYMBOL_NOTIONALS_CONFIG)
+        # Anti-Chop Quarantine post stop-loss (prevents serial revenge entries)
+        self.stop_loss_quarantine: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
 
     # -------------------------------------------------------------------------
     # Formatting Helpers
@@ -802,7 +860,9 @@ class QuantitativeTradingAgent:
     def _get_active_module_count(self, module: str) -> int:
         return sum(1 for m in self.active_modules.values() if m == module)
 
-    async def calculate_risk_position_size(self, symbol: str, entry_price: float, atr: float) -> float:
+    async def calculate_risk_position_size(
+        self, symbol: str, entry_price: float, atr: float, target_cap: Optional[float] = None
+    ) -> float:
         collateral = await self.get_collateral_balance()
         # 1.00% portfolio risk per trade = ~$10,000 risk budget on $1M pool
         risk_budget = collateral * RISK_FACTOR
@@ -818,8 +878,11 @@ class QuantitativeTradingAgent:
 
         raw_qty = net_risk_budget / sl_distance
 
-        # Strict Symbol Position Cap: BTC $250k, ETH $200k, SOL $150k
-        sym_max_notional = self.target_symbol_notionals.get(symbol, MAX_SINGLE_TRADE_NOTIONAL)
+        # Symbol Position Cap: Scaled by confidence tier if specified, else target_symbol_notionals
+        if target_cap is not None and target_cap > 0:
+            sym_max_notional = min(target_cap, MAX_SINGLE_TRADE_NOTIONAL)
+        else:
+            sym_max_notional = self.target_symbol_notionals.get(symbol, MAX_SINGLE_TRADE_NOTIONAL)
         existing_pos = self.positions.get(symbol)
         existing_sym_notional = abs(float(existing_pos.get("notional", 0.0))) if existing_pos else 0.0
         
@@ -1105,6 +1168,12 @@ class QuantitativeTradingAgent:
         if DRY_RUN:
             logger.info(f"[{symbol}] DRY_RUN enabled. Position close simulated (reason='{reason}').")
             self.last_trade_time[symbol] = time.time()
+            if "stop_loss" in str(reason).lower() or "sl_" in str(reason).lower():
+                self.stop_loss_quarantine[symbol] = time.time() + STOP_LOSS_QUARANTINE_SECONDS
+                logger.info(
+                    f"[{symbol}] [ANTI_CHOP_QUARANTINE] Position stopped out ({reason}). "
+                    f"Quarantine active for {STOP_LOSS_QUARANTINE_SECONDS // 60}m to prevent serial chop."
+                )
             self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
             self.position_source_module.pop(symbol, None)
             self.positions.pop(symbol, None)
@@ -1173,6 +1242,12 @@ class QuantitativeTradingAgent:
             if success and oid:
                 logger.info(f"[{symbol}] Position closed successfully: order_id={oid} reason='{reason}'")
                 self.last_trade_time[symbol] = time.time()
+                if "stop_loss" in str(reason).lower() or "sl_" in str(reason).lower():
+                    self.stop_loss_quarantine[symbol] = time.time() + STOP_LOSS_QUARANTINE_SECONDS
+                    logger.info(
+                        f"[{symbol}] [ANTI_CHOP_QUARANTINE] Position stopped out ({reason}). "
+                        f"Quarantine active for {STOP_LOSS_QUARANTINE_SECONDS // 60}m to prevent serial chop."
+                    )
                 self.position_peak_pnl.pop(f"{symbol}_{pos.get('side', '')}", None)
                 self.position_source_module.pop(symbol, None)
                 self.active_exit_orders.pop(symbol, None)
@@ -1600,14 +1675,131 @@ class QuantitativeTradingAgent:
     # -------------------------------------------------------------------------
     # Strategy Modules
     # -------------------------------------------------------------------------
+    def get_macro_trend(self, symbol: str) -> Tuple[str, float]:
+        """
+        Determines the 1-Hour Macro Directional Trend using EMA 50 vs EMA 200.
+        Returns:
+            ("BULLISH", spread) if EMA50 > EMA200 and close >= EMA50
+            ("BEARISH", spread) if EMA50 < EMA200 and close <= EMA50
+            ("NEUTRAL", spread) otherwise
+        """
+        df_1h = self.md_manager.get_macro_dataframe(symbol)
+        if len(df_1h) < 30:
+            # Fallback to 15m EMA50/100 if 1h candles not yet loaded
+            df_15m = self.md_manager.get_dataframe(symbol)
+            if len(df_15m) < 50:
+                return "NEUTRAL", 0.0
+            ema_fast = df_15m["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+            ema_slow = df_15m["close"].ewm(span=100, adjust=False).mean().iloc[-1]
+            close = float(df_15m["close"].iloc[-1])
+        else:
+            ema_fast = df_1h["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+            ema_slow = df_1h["close"].ewm(span=200, adjust=False).mean().iloc[-1]
+            close = float(df_1h["close"].iloc[-1])
+
+        spread = float(ema_fast - ema_slow)
+        if (ema_fast > ema_slow) and (close >= ema_fast):
+            return "BULLISH", spread
+        elif (ema_fast < ema_slow) and (close <= ema_fast):
+            return "BEARISH", spread
+        return "NEUTRAL", spread
+
+    def calculate_trade_confidence(
+        self, symbol: str, proposed_side: str, df: pd.DataFrame
+    ) -> Tuple[float, Dict[str, Any]]:
+        """
+        Calculates a Trade Confidence Score (0 to 100) based on:
+        1. Macro Confluence (1-Hour 50/200 EMA): 40 pts max (or instant VETO if opposing)
+        2. Trend Strength (ADX >= 26.0): 25 pts max (or instant VETO if ADX < 26)
+        3. Volatility Expansion (ATR Ratio >= 0.0065): 15 pts max
+        4. Momentum & Separation (EMA Ribbon + RSI corridor): 20 pts max
+        """
+        if len(df) < 20:
+            return 0.0, {"reason": "insufficient_data"}
+
+        latest = df.iloc[-1]
+        close = float(latest["close"])
+        ema_20 = float(latest["ema_20"])
+        ema_50 = float(latest["ema_50"])
+        rsi = float(latest.get("rsi", 50.0) or 50.0)
+        adx = float(latest.get("adx", 0.0) or 0.0)
+        atr = float(latest.get("atr", 0.0) or 0.0)
+        atr_ratio = atr / close if close > 0 else 0.0
+
+        macro_dir, macro_spread = self.get_macro_trend(symbol)
+
+        # 1. Hard Macro Veto: NEVER trade counter-trend to 1-Hour macro
+        # [FDE-WHY]: Hard macro veto prevents trading against the 1-Hour EMA trend, eliminating bear-market bounce stop-outs.
+        if proposed_side == "BUY" and macro_dir == "BEARISH":
+            return 0.0, {"reason": f"macro_bearish_veto (1H EMA50 < EMA200, spread={macro_spread:.2f})"}
+        if proposed_side == "SELL" and macro_dir == "BULLISH":
+            return 0.0, {"reason": f"macro_bullish_veto (1H EMA50 > EMA200, spread={macro_spread:.2f})"}
+
+        # 2. Hard ADX Chop Veto: Must have genuine momentum
+        if adx < TREND_ADX_THRESHOLD:
+            return 0.0, {"reason": f"low_adx_chop_veto ({adx:.1f} < {TREND_ADX_THRESHOLD})"}
+
+        score = 0.0
+
+        # Score Component 1: Macro Alignment (40 pts)
+        if (proposed_side == "BUY" and macro_dir == "BULLISH") or (proposed_side == "SELL" and macro_dir == "BEARISH"):
+            score += 40.0
+        elif macro_dir == "NEUTRAL":
+            score += 15.0
+
+        # Score Component 2: ADX Conviction (25 pts)
+        if adx >= 32.0:
+            score += 25.0
+        elif adx >= 28.0:
+            score += 20.0
+        elif adx >= 26.0:
+            score += 15.0
+
+        # Score Component 3: Volatility Expansion (15 pts)
+        if atr_ratio >= 0.0080:
+            score += 15.0
+        elif atr_ratio >= 0.0065:
+            score += 10.0
+        else:
+            score += 5.0
+
+        # Score Component 4: Momentum & Separation (20 pts)
+        ribbon_spread = abs(ema_20 - ema_50)
+        if atr > 0 and (ribbon_spread >= 0.12 * atr):
+            score += 10.0
+
+        if proposed_side == "BUY" and (44.0 <= rsi <= 64.0):
+            score += 10.0
+        elif proposed_side == "SELL" and (36.0 <= rsi <= 56.0):
+            score += 10.0
+        elif (35.0 <= rsi <= 65.0):
+            score += 5.0
+
+        breakdown = {
+            "score": score,
+            "macro_dir": macro_dir,
+            "adx": adx,
+            "atr_ratio": atr_ratio,
+            "rsi": rsi,
+            "ribbon_spread": ribbon_spread,
+        }
+        return score, breakdown
+
     async def execute_trend_module(self, symbol: str, mid_price: float):
         if symbol in self.positions:
             return "already_positioned"
 
+        now_ts = time.time()
+        # [FDE-WHY]: 2-Hour post-stop quarantine prevents re-entering a consolidating asset that just chopped us out.
+        quarantine_until = self.stop_loss_quarantine.get(symbol, 0.0)
+        if now_ts < quarantine_until:
+            rem = int(quarantine_until - now_ts)
+            return f"in_stop_loss_quarantine ({rem}s remaining)"
+
         pending_entry = self.pending_entry_orders.get(symbol)
         if pending_entry:
             oid, ots = pending_entry
-            if (time.time() - ots) > TRADE_COOLDOWN_SECONDS:
+            if (now_ts - ots) > TRADE_COOLDOWN_SECONDS:
                 try:
                     await self.client.cancel_order(order_id=oid, symbol=symbol)
                 except Exception:
@@ -1638,9 +1830,9 @@ class QuantitativeTradingAgent:
         if adx < TREND_ADX_THRESHOLD:
             return "low_adx"
 
-        # EMA Separation Buffer: 0.05x real_atr (eliminates micro-touches while capturing real trend legs)
+        # EMA Separation Buffer: 0.08x real_atr (eliminates micro-touches while capturing real trend legs)
         ema_spread = abs(ema_20 - ema_50)
-        if ema_spread < (0.05 * real_atr):
+        if ema_spread < (0.08 * real_atr):
             return "tight_ema_spread"
 
         bullish_cross = (prev_ema20 <= prev_ema50) and (ema_20 > ema_50)
@@ -1652,27 +1844,55 @@ class QuantitativeTradingAgent:
 
         # LONG: confirmed bullish momentum, RSI corridor (38-68), no punitive funding headwind
         if (bullish_cross or bullish_trend) and (38.0 <= rsi <= 68.0) and (funding <= 0.0004):
+            conf_score, conf_meta = self.calculate_trade_confidence(symbol, "BUY", df)
+            if conf_score < MIN_CONFIDENCE_SCORE:
+                return f"low_confidence_{conf_score:.0f}_{conf_meta.get('reason', '')}"
+
             if self._get_active_module_count("A") >= config["max_pos"] or not self._check_portfolio_heat():
                 return "blocked_risk"
+
+            # Scaled notional based on confidence tier
+            if conf_score >= HIGH_CONFIDENCE_SCORE:
+                target_notional = HIGH_CONFIDENCE_SYMBOL_NOTIONALS.get(symbol, 240000.0)
+                logger.info(f"[{symbol}] HIGH CONVICTION BUY SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
+            else:
+                target_notional = STANDARD_SYMBOL_NOTIONALS.get(symbol, 160000.0)
+                logger.info(f"[{symbol}] STANDARD CONVICTION BUY SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
+
             await self._switch_module(symbol, "A")
             await self._set_leverage(symbol, config["leverage"])
             # Pullback pricing anchor: enter near EMA20 or close
             entry_price = min(close, ema_20 * 1.001)
-            qty = await self.calculate_risk_position_size(symbol, entry_price, effective_atr)
+            qty = await self.calculate_risk_position_size(symbol, entry_price, effective_atr, target_cap=target_notional)
             ok = await self.place_directional_order(symbol, "BUY", entry_price, qty, effective_atr, module="A")
             return "entered_long" if ok else "order_rejected"
 
         # SHORT: confirmed bearish momentum, RSI corridor (32-62), no punitive funding headwind
         elif (bearish_cross or bearish_trend) and (32.0 <= rsi <= 62.0) and (funding >= -0.0004):
+            conf_score, conf_meta = self.calculate_trade_confidence(symbol, "SELL", df)
+            if conf_score < MIN_CONFIDENCE_SCORE:
+                return f"low_confidence_{conf_score:.0f}_{conf_meta.get('reason', '')}"
+
             if self._get_active_module_count("A") >= config["max_pos"] or not self._check_portfolio_heat():
                 return "blocked_risk"
+
+            # Scaled notional based on confidence tier
+            if conf_score >= HIGH_CONFIDENCE_SCORE:
+                target_notional = HIGH_CONFIDENCE_SYMBOL_NOTIONALS.get(symbol, 240000.0)
+                logger.info(f"[{symbol}] HIGH CONVICTION SELL SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
+            else:
+                target_notional = STANDARD_SYMBOL_NOTIONALS.get(symbol, 160000.0)
+                logger.info(f"[{symbol}] STANDARD CONVICTION SELL SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
+
             await self._switch_module(symbol, "A")
             await self._set_leverage(symbol, config["leverage"])
             # Pullback pricing anchor: enter near EMA20 or close
             entry_price = max(close, ema_20 * 0.999)
-            qty = await self.calculate_risk_position_size(symbol, entry_price, effective_atr)
+            qty = await self.calculate_risk_position_size(symbol, entry_price, effective_atr, target_cap=target_notional)
             ok = await self.place_directional_order(symbol, "SELL", entry_price, qty, effective_atr, module="A")
             return "entered_short" if ok else "order_rejected"
+
+        return "no_signal"
 
         return "no_signal"
 
@@ -2025,12 +2245,14 @@ class QuantitativeTradingAgent:
         self.active_modules[symbol] = new_module
 
     async def seed_historical_candles(self):
-        logger.info(f"Seeding historical {CANDLE_INTERVAL} candles from Hyperliquid reference feed...")
+        logger.info(f"Seeding historical {CANDLE_INTERVAL} and {MACRO_CANDLE_INTERVAL} candles from Hyperliquid reference feed...")
         try:
             async with httpx.AsyncClient(timeout=10.0) as http:
                 now_ms = int(time.time() * 1000)
                 start_ms = now_ms - (3 * 86400 * 1000)  # 3 days of 15m candles (288 periods)
+                start_ms_1h = now_ms - (14 * 86400 * 1000)  # 14 days of 1h macro candles (336 periods)
                 for symbol, key in REFERENCE_MID_KEYS.items():
+                    # 1. 15m Execution candles
                     try:
                         resp = await http.post(
                             REFERENCE_MID_URL,
@@ -2045,7 +2267,23 @@ class QuantitativeTradingAgent:
                                     f"[{symbol}] Seeded {len(candles)} {CANDLE_INTERVAL} candles (close=${candles[-1].get('c')})"
                                 )
                     except Exception as e:
-                        logger.warning(f"[{symbol}] Historical candle seeding notice: {e}")
+                        logger.warning(f"[{symbol}] Historical 15m candle seeding notice: {e}")
+
+                    # 2. 1H Macro Anchor candles
+                    try:
+                        resp_1h = await http.post(
+                            REFERENCE_MID_URL,
+                            json={"type": "candleSnapshot", "req": {"coin": key, "interval": MACRO_CANDLE_INTERVAL, "startTime": start_ms_1h}},
+                        )
+                        if resp_1h.status_code == 200:
+                            candles_1h = resp_1h.json()
+                            if candles_1h and isinstance(candles_1h, list):
+                                self.md_manager.seed_macro_candles(symbol, candles_1h)
+                                logger.info(
+                                    f"[{symbol}] Seeded {len(candles_1h)} {MACRO_CANDLE_INTERVAL} macro candles"
+                                )
+                    except Exception as e:
+                        logger.warning(f"[{symbol}] Historical 1h macro candle seeding notice: {e}")
         except Exception as e:
             logger.warning(f"Error seeding historical candles: {e}")
 
@@ -2054,6 +2292,7 @@ class QuantitativeTradingAgent:
             async with httpx.AsyncClient(timeout=6.0) as http:
                 now_ms = int(time.time() * 1000)
                 start_ms = now_ms - (3 * 86400 * 1000)
+                start_ms_1h = now_ms - (14 * 86400 * 1000)
                 for symbol, key in REFERENCE_MID_KEYS.items():
                     try:
                         resp = await http.post(
@@ -2065,7 +2304,19 @@ class QuantitativeTradingAgent:
                             if candles and isinstance(candles, list):
                                 self.md_manager.seed_candles(symbol, candles)
                     except Exception as e:
-                        logger.debug(f"[{symbol}] Candle sync notice: {e}")
+                        logger.debug(f"[{symbol}] 15m candle sync notice: {e}")
+
+                    try:
+                        resp_1h = await http.post(
+                            REFERENCE_MID_URL,
+                            json={"type": "candleSnapshot", "req": {"coin": key, "interval": MACRO_CANDLE_INTERVAL, "startTime": start_ms_1h}},
+                        )
+                        if resp_1h.status_code == 200:
+                            candles_1h = resp_1h.json()
+                            if candles_1h and isinstance(candles_1h, list):
+                                self.md_manager.seed_macro_candles(symbol, candles_1h)
+                    except Exception as e:
+                        logger.debug(f"[{symbol}] 1h macro candle sync notice: {e}")
         except Exception as e:
             logger.debug(f"Candle sync background notice: {e}")
 

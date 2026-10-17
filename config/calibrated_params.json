@@ -1,16 +1,32 @@
 {
-  "version": "4.0.0-sniper",
-  "timestamp": "2026-10-15T01:00:00.000000Z",
-  "strategy": "High-Conviction 15m Trend Expansion & Uncapped Trailing Runner Engine v4.0.0 (Bootcamp Final Stretch)",
+  "version": "5.0.0-confidence-sniper",
+  "timestamp": "2026-10-17T14:15:00.000000Z",
+  "strategy": "Multi-Timeframe Macro Confluence & Confidence-Scaled Sniper Engine v5.0.0 (Oct 26 Final Stretch)",
   "target_apr_pct": 120.0,
   "daily_profit_target_usd": 5000.0,
   "risk_management": {
     "risk_factor": 0.008,
-    "max_single_trade_notional": 180000.0,
+    "max_single_trade_notional": 200000.0,
     "max_portfolio_notional": 360000.0,
     "trade_cooldown_seconds": 1800,
+    "stop_loss_quarantine_seconds": 7200,
     "min_atr_ratio": 0.006,
     "max_fee_to_profit_ratio": 0.15
+  },
+  "confidence_engine": {
+    "min_confidence_score": 75.0,
+    "high_confidence_score": 85.0,
+    "require_macro_alignment": true,
+    "standard_symbol_notionals": {
+      "BTC-USDC-PERP": 130000.0,
+      "ETH-USDC-PERP": 100000.0,
+      "SOL-USDC-PERP": 80000.0
+    },
+    "high_confidence_symbol_notionals": {
+      "BTC-USDC-PERP": 180000.0,
+      "ETH-USDC-PERP": 150000.0,
+      "SOL-USDC-PERP": 120000.0
+    }
   },
   "target_symbol_notionals": {
     "BTC-USDC-PERP": 180000.0,
@@ -19,13 +35,16 @@
   },
   "module_a_trend": {
     "candle_interval": "15m",
+    "macro_candle_interval": "1h",
     "ema_fast": 20,
     "ema_slow": 50,
+    "macro_ema_fast": 50,
+    "macro_ema_slow": 200,
     "rsi_period": 14,
-    "adx_threshold": 22.0,
+    "adx_threshold": 26.0,
     "target_tp_pct": 0.048,
-    "stop_loss_pct": 0.009,
-    "breakeven_trigger_pct": 0.010,
+    "stop_loss_pct": 0.0085,
+    "breakeven_trigger_pct": 0.0090,
     "trailing_trigger_pct": 0.022,
     "trailing_retrace_pct": 0.008
   },
@@ -35,7 +54,7 @@
     "target_carry_notional": 50000.0
   },
   "position_management": {
-    "breakeven_trigger_pct": 0.010,
+    "breakeven_trigger_pct": 0.0090,
     "take_profit_atr_mult": 3.5,
     "stop_loss_atr_mult": 1.2,
     "profit_harvest_min_pnl_pct": 0.045,

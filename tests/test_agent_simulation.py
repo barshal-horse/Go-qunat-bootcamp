@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 import unittest
 import pandas as pd
 from dotenv import load_dotenv
@@ -246,7 +247,67 @@ class TestQuantAgentSimulation(unittest.TestCase):
 
         asyncio.run(run_async())
 
+    def test_macro_trend_veto_and_confluence(self):
+        """Verify that counter-trend trades are vetoed and aligned trends score high confidence."""
+        sym = "ETH-USDC-PERP"
+        # Seed 1H macro candles in a clear BEARISH trend (EMA50 < EMA200)
+        macro_candles = []
+        for i in range(100):
+            # Price falling from 3000 to 2400
+            px = 3000.0 - (i * 6.0)
+            macro_candles.append({"c": px, "h": px + 10, "l": px - 10, "v": 100})
+        self.agent.md_manager.seed_macro_candles(sym, macro_candles)
+
+        macro_dir, _ = self.agent.get_macro_trend(sym)
+        self.assertEqual(macro_dir, "BEARISH")
+
+        # 15m DataFrame showing a local bounce
+        candles_15m = []
+        for i in range(30):
+            px = 2400.0 + (i * 2.0)
+            candles_15m.append({"close": px, "high": px + 5, "low": px - 5, "volume": 50})
+        df_15m = pd.DataFrame(candles_15m)
+        df_15m = qta.TechnicalIndicators.calculate_indicators(df_15m)
+
+        # Proposed BUY into Macro BEAR should be completely VETOED (score = 0.0)
+        score_buy, meta_buy = self.agent.calculate_trade_confidence(sym, "BUY", df_15m)
+        self.assertEqual(score_buy, 0.0)
+        self.assertIn("macro_bearish_veto", meta_buy.get("reason", ""))
+
+        # Proposed SELL with Macro BEAR alignment should NOT be vetoed
+        score_sell, _ = self.agent.calculate_trade_confidence(sym, "SELL", df_15m)
+        self.assertGreater(score_sell, 0.0)
+
+    def test_stop_loss_quarantine_lock(self):
+        """Verify that a stop-out enforces a 2-hour quarantine on that symbol."""
+        async def run_async():
+            sym = "SOL-USDC-PERP"
+            self.agent.positions[sym] = {
+                "symbol": sym,
+                "size": 100.0,
+                "notional": 12000.0,
+                "entry_price": 120.0,
+                "side": "BUY",
+            }
+            self.agent.position_source_module[sym] = "A"
+            self.agent.md_manager.current_mids[sym] = 117.0
+
+            # Execute close with stop loss reason
+            closed = await self.agent.close_position(sym, reason="stop_loss_-0.85%", aggressive=True)
+            self.assertTrue(closed)
+
+            # Check that quarantine is active
+            now_ts = time.time()
+            self.assertGreater(self.agent.stop_loss_quarantine[sym], now_ts + 7000)
+
+            # Trend module should refuse new entry due to quarantine
+            decision = await self.agent.execute_trend_module(sym, 117.0)
+            self.assertIn("in_stop_loss_quarantine", decision)
+
+        asyncio.run(run_async())
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

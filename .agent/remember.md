@@ -1,26 +1,30 @@
 # Agent Session Memory & Strategy Status
 
-## Current Context (October 15, 2026 - Bootcamp Final Stretch)
-- **Deadline**: October 26, 2026 (~11 days remaining).
-- **Core Mission**: Recover -$31,001.12 drawdown and maximize total PnL with minimum trade turnover.
-- **Account Capital**: $969,028.41 USDC (Initial: $1,000,000.00).
+## Current Context (October 17, 2026 - Sniper Calibration v5.0.0)
+- **Time**: 14:20 UTC (19:50 IST) Oct 17.
+- **Deadline**: October 26, 2026 (~9 days remaining).
+- **Total Collateral**: **$967,516.96 USDC** (Baseline stabilized).
+- **Free Collateral**: $857,652.79 USDC.
 
-## 15m Sniper Maximum Profit Engine (v4.0.0-sniper)
-1. **Timeframe Shift**: Switched from 1m tick noise to authentic 15-minute candles (`interval: "15m"`) via Hyperliquid reference feeds (3 days / 288 periods lookback).
-2. **Sniper Position Sizing**:
-   - BTC-USDC-PERP: $180,000
-   - ETH-USDC-PERP: $150,000
-   - SOL-USDC-PERP: $120,000
-   - Max portfolio notional: $360,000 (~0.36x safe leverage).
-3. **Asymmetric Risk/Reward & Armor**:
-   - Hard stop loss: -0.90% ($1,350 - $1,620 max risk per trade).
-   - Auto-Breakeven Shield: The moment price hits +1.00%, stop loss jumps to Breakeven (+0.05% fee buffer). Zero risk of winning trades turning into losses.
-   - Trailing Runner: Engages at +2.20% peak, trailing by 80 bps.
-   - Major Target: +4.80% ($7,000 - $8,600 profit per runner).
-4. **Strict Anti-Churn & Discipline**:
-   - ADX >= 22 required for trend confirmation.
-   - Trade cooldown: 1800s (30 minutes).
-   - Total trade budget: ~10 to 18 high-conviction trades across the entire 11-day period.
+## Daily Breakdown
+- **October 15**: +$6,539.08 Net Profit (19W / 5L)
+- **October 16**: -$8,053.41 (7W / 14L - chop churn & counter-trend bounces)
+- **October 17**: -$777.98 (3W / 2L)
+  - Controlled stops capped under $850, zero catastrophic drawdowns.
 
-## Verification & Deployment
-- All 13 simulation unit tests in `tests/test_agent_simulation.py` passed cleanly (including breakeven shield test).
+## Architectural Upgrade: v5.0.0 Confidence-Scaled Sniper Engine
+1. **Multi-Timeframe Macro Anchor (1-Hour 50/200 EMA)**:
+   - Evaluates 1H macro trend on Hyperliquid feed.
+   - **Hard Veto**: Zero counter-trend trades. If 1H is Macro Bear, all 15m Longs are instantly vetoed (Confidence = 0).
+2. **Confidence-Scaled Sizing (0–100 Score)**:
+   - **Score < 75**: 100% Cash / No Trade (Preserves capital against chop).
+   - **Score 75–84**: Standard notional ($100k–$130k).
+   - **Score >= 85 (High Conviction)**: Sniper notional ($150k–$180k) with +4.8% uncapped runner.
+3. **2-Hour Anti-Chop Quarantine Post-Stop**:
+   - `self.stop_loss_quarantine[symbol] = now + 7200s` on stop-out.
+   - Eliminates serial churn in consolidating assets.
+4. **Verified via Tests**:
+   - 15/15 unit tests passing in `tests/test_agent_simulation.py`.
+
+## Next Step
+- Commit changes and push to `main` so GitHub Actions runner runs the v5.0.0 Sniper Engine.
