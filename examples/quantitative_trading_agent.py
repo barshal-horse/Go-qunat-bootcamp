@@ -341,9 +341,9 @@ SYMBOLS = ["BTC-USDC-PERP", "ETH-USDC-PERP", "SOL-USDC-PERP"]
 DEFAULT_LEVERAGE = 3
 # Risk & Capital Architecture (15m Sniper Maximum Profit Engine on $1M pool)
 # Scaled notional ($120k-$180k) with strict breakeven protection and 30-minute patience cooldown
-RISK_FACTOR = 0.008
-MAX_SINGLE_TRADE_NOTIONAL = 180000.0  # Max $180k notional per single trade (~0.18x portfolio leverage)
-MAX_PORTFOLIO_NOTIONAL = 360000.0     # Max $360k total notional across all assets (~0.36x total leverage)
+RISK_FACTOR = 0.010
+MAX_SINGLE_TRADE_NOTIONAL = 250000.0  # Max $250k notional per single trade (~0.25x portfolio leverage)
+MAX_PORTFOLIO_NOTIONAL = 500000.0     # Max $500k total notional across all assets (~0.50x total leverage)
 TRADE_COOLDOWN_SECONDS = 1800         # 30-minute cooldown per symbol (strictly eliminates overtrading churn)
 
 LOOP_INTERVAL_SECONDS = 15
@@ -413,34 +413,35 @@ TRAILING_RETRACE_RATIO = 0.35
 TAKE_PROFIT_ATR_MULT = 2.5           # Positive 1:2.0+ Risk/Reward target
 STOP_LOSS_ATR_MULT = 1.2             # Controlled risk distance
 
-# Directional & Harvest Calibration (15m Sniper Maximum Profit Engine)
-TREND_TP_PCT = 0.048                 # +4.80% trend take-profit target ($8,640 on $180k)
+# Directional & Harvest Calibration (Active 2-Tier Alpha Sniper Engine)
+TREND_TP_PCT = 0.048                 # +4.80% trend take-profit target
 TREND_SL_PCT = 0.0085                # -0.85% controlled protective stop loss
-BREAKEVEN_TRIGGER_PCT = 0.0090       # +0.90% trigger to lock stop loss at breakeven (risk-free runner)
+BREAKEVEN_TRIGGER_PCT = 0.0085       # +0.85% trigger to lock stop loss at breakeven (risk-free runner)
 TREND_TRAILING_TRIGGER = 0.022       # +2.20% trigger for trailing profit runner
 TREND_TRAILING_RETRACE = 0.008       # 80 bps trailing pullback allowance
-TREND_ADX_THRESHOLD = 26.0           # Strong trend conviction (filters out all chop)
+TREND_ADX_THRESHOLD = 22.0           # Entry ADX threshold for active participation
+HIGH_ADX_THRESHOLD = 25.0            # High-conviction ADX threshold for Tier-1 Alpha sizing
 PROFIT_HARVEST_MIN_PNL_PCT = 0.045   # +4.50% minimum before profit harvest can trigger
-PROFIT_HARVEST_MIN_USD = 6500.0      # $6,500 dollar profit floor
+PROFIT_HARVEST_MIN_USD = 7500.0      # $7,500 dollar profit floor
 CANDLE_INTERVAL = "15m"              # 15-minute execution timeframe
 MACRO_CANDLE_INTERVAL = "1h"          # 1-hour macro anchor timeframe
 STOP_LOSS_QUARANTINE_SECONDS = 7200   # 2-hour quarantine on symbol post stop-loss
-MIN_CONFIDENCE_SCORE = 75.0           # Min confidence score required to trade
-HIGH_CONFIDENCE_SCORE = 85.0          # High-confidence threshold for max notional sizing
+MIN_CONFIDENCE_SCORE = 65.0           # Min confidence score for Tier-2 Tactical entries
+HIGH_CONFIDENCE_SCORE = 78.0          # High-confidence threshold for Tier-1 Alpha sizing ($220k-$250k)
 STANDARD_SYMBOL_NOTIONALS = {
-    "BTC-USDC-PERP": 160000.0,
+    "BTC-USDC-PERP": 150000.0,
     "ETH-USDC-PERP": 130000.0,
-    "SOL-USDC-PERP": 100000.0,
+    "SOL-USDC-PERP": 110000.0,
 }
 HIGH_CONFIDENCE_SYMBOL_NOTIONALS = {
-    "BTC-USDC-PERP": 240000.0,
-    "ETH-USDC-PERP": 200000.0,
-    "SOL-USDC-PERP": 150000.0,
+    "BTC-USDC-PERP": 250000.0,
+    "ETH-USDC-PERP": 220000.0,
+    "SOL-USDC-PERP": 180000.0,
 }
 TARGET_SYMBOL_NOTIONALS_CONFIG = {
-    "BTC-USDC-PERP": 180000.0,
-    "ETH-USDC-PERP": 150000.0,
-    "SOL-USDC-PERP": 120000.0,
+    "BTC-USDC-PERP": 250000.0,
+    "ETH-USDC-PERP": 220000.0,
+    "SOL-USDC-PERP": 180000.0,
 }
 
 # Check if external calibrated params exist and load them
@@ -496,6 +497,8 @@ if os.path.exists(CALIBRATED_CONFIG_PATH):
                 TREND_TRAILING_RETRACE = float(ma["trailing_retrace_pct"])
             if "adx_threshold" in ma:
                 TREND_ADX_THRESHOLD = float(ma["adx_threshold"])
+            if "high_adx_threshold" in ma:
+                HIGH_ADX_THRESHOLD = float(ma["high_adx_threshold"])
             if "candle_interval" in ma:
                 CANDLE_INTERVAL = str(ma["candle_interval"])
             if "macro_candle_interval" in ma:
@@ -1748,31 +1751,31 @@ class QuantitativeTradingAgent:
             score += 15.0
 
         # Score Component 2: ADX Conviction (25 pts)
-        if adx >= 32.0:
+        if adx >= HIGH_ADX_THRESHOLD:
             score += 25.0
-        elif adx >= 28.0:
+        elif adx >= 23.5:
             score += 20.0
-        elif adx >= 26.0:
+        elif adx >= TREND_ADX_THRESHOLD:
             score += 15.0
 
         # Score Component 3: Volatility Expansion (15 pts)
-        if atr_ratio >= 0.0080:
+        if atr_ratio >= 0.0075:
             score += 15.0
-        elif atr_ratio >= 0.0065:
+        elif atr_ratio >= 0.0055:
             score += 10.0
         else:
             score += 5.0
 
         # Score Component 4: Momentum & Separation (20 pts)
         ribbon_spread = abs(ema_20 - ema_50)
-        if atr > 0 and (ribbon_spread >= 0.12 * atr):
+        if atr > 0 and (ribbon_spread >= 0.08 * atr):
             score += 10.0
 
-        if proposed_side == "BUY" and (44.0 <= rsi <= 64.0):
+        if proposed_side == "BUY" and (42.0 <= rsi <= 66.0):
             score += 10.0
-        elif proposed_side == "SELL" and (36.0 <= rsi <= 56.0):
+        elif proposed_side == "SELL" and (34.0 <= rsi <= 58.0):
             score += 10.0
-        elif (35.0 <= rsi <= 65.0):
+        elif (32.0 <= rsi <= 68.0):
             score += 5.0
 
         breakdown = {
@@ -1786,7 +1789,10 @@ class QuantitativeTradingAgent:
         return score, breakdown
 
     async def execute_trend_module(self, symbol: str, mid_price: float):
-        if symbol in self.positions:
+        # Position Upgrade Check: If position was opened by Module C (carry), allow upgrading to Module A trend runner
+        has_pos = symbol in self.positions
+        source_mod = self.position_source_module.get(symbol)
+        if has_pos and source_mod != "C":
             return "already_positioned"
 
         now_ts = time.time()
@@ -1826,13 +1832,13 @@ class QuantitativeTradingAgent:
         adx = float(latest.get("adx", 0.0) or 0.0)
         funding = self.funding_rates.get(symbol, 0.0)
 
-        # Trend Confirmation: Allow trends when ADX >= TREND_ADX_THRESHOLD (filters out choppy false breakouts)
+        # Trend Confirmation: Allow trends when ADX >= TREND_ADX_THRESHOLD (22.0)
         if adx < TREND_ADX_THRESHOLD:
             return "low_adx"
 
-        # EMA Separation Buffer: 0.08x real_atr (eliminates micro-touches while capturing real trend legs)
+        # EMA Separation Buffer: 0.06x real_atr (eliminates micro-touches while capturing real trend legs)
         ema_spread = abs(ema_20 - ema_50)
-        if ema_spread < (0.08 * real_atr):
+        if ema_spread < (0.06 * real_atr):
             return "tight_ema_spread"
 
         bullish_cross = (prev_ema20 <= prev_ema50) and (ema_20 > ema_50)
@@ -1853,11 +1859,17 @@ class QuantitativeTradingAgent:
 
             # Scaled notional based on confidence tier
             if conf_score >= HIGH_CONFIDENCE_SCORE:
-                target_notional = HIGH_CONFIDENCE_SYMBOL_NOTIONALS.get(symbol, 240000.0)
-                logger.info(f"[{symbol}] HIGH CONVICTION BUY SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
+                target_notional = HIGH_CONFIDENCE_SYMBOL_NOTIONALS.get(symbol, 250000.0)
+                logger.info(f"[{symbol}] TIER 1 ALPHA BUY SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
             else:
-                target_notional = STANDARD_SYMBOL_NOTIONALS.get(symbol, 160000.0)
-                logger.info(f"[{symbol}] STANDARD CONVICTION BUY SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
+                target_notional = STANDARD_SYMBOL_NOTIONALS.get(symbol, 150000.0)
+                logger.info(f"[{symbol}] TIER 2 TACTICAL BUY SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
+
+            # If holding a Module C carry position, close it to free up margin for the trend runner
+            if has_pos and source_mod == "C":
+                logger.info(f"[{symbol}] [ALPHA_UPGRADE] Closing $50k carry position to deploy ${target_notional:,.0f} Module A Trend Runner!")
+                await self.close_position(symbol, reason="upgrade_carry_to_alpha_trend", aggressive=True)
+                await asyncio.sleep(0.5)
 
             await self._switch_module(symbol, "A")
             await self._set_leverage(symbol, config["leverage"])
@@ -1878,11 +1890,17 @@ class QuantitativeTradingAgent:
 
             # Scaled notional based on confidence tier
             if conf_score >= HIGH_CONFIDENCE_SCORE:
-                target_notional = HIGH_CONFIDENCE_SYMBOL_NOTIONALS.get(symbol, 240000.0)
-                logger.info(f"[{symbol}] HIGH CONVICTION SELL SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
+                target_notional = HIGH_CONFIDENCE_SYMBOL_NOTIONALS.get(symbol, 250000.0)
+                logger.info(f"[{symbol}] TIER 1 ALPHA SELL SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
             else:
-                target_notional = STANDARD_SYMBOL_NOTIONALS.get(symbol, 160000.0)
-                logger.info(f"[{symbol}] STANDARD CONVICTION SELL SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
+                target_notional = STANDARD_SYMBOL_NOTIONALS.get(symbol, 150000.0)
+                logger.info(f"[{symbol}] TIER 2 TACTICAL SELL SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
+
+            # If holding a Module C carry position, close it to free up margin for the trend runner
+            if has_pos and source_mod == "C":
+                logger.info(f"[{symbol}] [ALPHA_UPGRADE] Closing $50k carry position to deploy ${target_notional:,.0f} Module A Trend Runner!")
+                await self.close_position(symbol, reason="upgrade_carry_to_alpha_trend", aggressive=True)
+                await asyncio.sleep(0.5)
 
             await self._switch_module(symbol, "A")
             await self._set_leverage(symbol, config["leverage"])
@@ -1892,8 +1910,8 @@ class QuantitativeTradingAgent:
             ok = await self.place_directional_order(symbol, "SELL", entry_price, qty, effective_atr, module="A")
             return "entered_short" if ok else "order_rejected"
 
-        return "no_signal"
-
+        if has_pos:
+            return "already_positioned"
         return "no_signal"
 
     async def execute_funding_module(self, symbol: str, mid_price: float):
@@ -2197,11 +2215,12 @@ class QuantitativeTradingAgent:
 
         funding = abs(self.funding_rates.get(symbol, 0.0))
 
-        # Institutional Dual-Engine Architecture (v3.0.0):
-        # 1. Extreme Funding Yield (>= FUNDING_SHORT_THRESHOLD = 15 bps/hr): Prioritize Carry Harvesting (Module C)
-        if funding >= FUNDING_SHORT_THRESHOLD:
+        # Subordinate Module C (Funding Carry):
+        # Only switch to FUNDING regime if funding is truly extreme (>= FUNDING_SHORT_THRESHOLD)
+        # AND market is NOT in a strong directional trend (adx < HIGH_ADX_THRESHOLD).
+        # This guarantees Module A always gets priority during trend momentum expansion!
+        if (funding >= FUNDING_SHORT_THRESHOLD) and (adx < HIGH_ADX_THRESHOLD):
             raw_regime = "FUNDING"
-        # 2. Primary Engine: High-Conviction Directional Trend Momentum (Module A)
         else:
             raw_regime = "TREND"
 

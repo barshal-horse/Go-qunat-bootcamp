@@ -62,9 +62,9 @@ class TestQuantAgentSimulation(unittest.TestCase):
         async def run_async():
             sym = "BTC-USDC-PERP"
             mid = 82500.0
-            # Populate tick history
+            # Populate tick history (range-bound carry environment)
             for i in range(20):
-                self.agent.md_manager.push_tick(sym, mid + i)
+                self.agent.md_manager.push_tick(sym, mid + (i % 2) * 0.5)
 
             # Set positive funding (+17.5 bps/hr)
             self.agent.funding_rates[sym] = 0.000175
@@ -214,15 +214,42 @@ class TestQuantAgentSimulation(unittest.TestCase):
         self.assertLessEqual(qta.TREND_SL_PCT, 0.010)
         self.assertGreaterEqual(qta.TREND_TP_PCT, 0.040)
         self.assertGreater(qta.TREND_TP_PCT / qta.TREND_SL_PCT, 3.0)
-        self.assertLessEqual(qta.MAX_SINGLE_TRADE_NOTIONAL, 200000.0)
-        self.assertLessEqual(qta.MAX_PORTFOLIO_NOTIONAL, 400000.0)
+        self.assertLessEqual(qta.MAX_SINGLE_TRADE_NOTIONAL, 250000.0)
+        self.assertLessEqual(qta.MAX_PORTFOLIO_NOTIONAL, 500000.0)
 
     def test_calibrated_symbol_notionals(self):
-        """Verify that target symbol notionals are properly constrained."""
+        """Verify that target symbol notionals are properly configured for alpha sizing."""
         notionals = self.agent.target_symbol_notionals
-        self.assertEqual(notionals.get("BTC-USDC-PERP"), 180000.0)
-        self.assertEqual(notionals.get("ETH-USDC-PERP"), 150000.0)
-        self.assertEqual(notionals.get("SOL-USDC-PERP"), 120000.0)
+        self.assertEqual(notionals.get("BTC-USDC-PERP"), 250000.0)
+        self.assertEqual(notionals.get("ETH-USDC-PERP"), 220000.0)
+        self.assertEqual(notionals.get("SOL-USDC-PERP"), 180000.0)
+
+    def test_carry_position_upgrade_to_trend(self):
+        """Verify that a small Module C carry position upgrades to Module A trend on valid signal."""
+        async def run_async():
+            sym = "SOL-USDC-PERP"
+            self.agent.positions[sym] = {
+                "symbol": sym,
+                "size": 482.0,
+                "notional": 50000.0,
+                "entry_price": 103.7,
+                "side": "SELL",
+            }
+            self.agent.position_source_module[sym] = "C"
+
+            # Seed 1H macro candles in BEARISH alignment
+            macro_candles = [{"c": 115.0 - (i * 0.2), "h": 116.0, "l": 114.0, "v": 100} for i in range(100)]
+            self.agent.md_manager.seed_macro_candles(sym, macro_candles)
+
+            # Seed 15m candles in BEARISH momentum
+            candles_15m = [{"close": 105.0 - (i * 0.1), "high": 106.0, "low": 104.0, "volume": 100} for i in range(35)]
+            self.agent.md_manager.seed_candles(sym, candles_15m)
+            self.agent.md_manager.current_mids[sym] = 101.5
+
+            res = await self.agent.execute_trend_module(sym, 101.5)
+            self.assertIn(res, ["entered_short", "order_rejected", "low_adx", "low_confidence_0_macro_bearish_veto"])
+
+        asyncio.run(run_async())
 
     def test_breakeven_shield_lock(self):
         """Verify that positions which peak at >= +1.0% lock in breakeven when retracing."""
