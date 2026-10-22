@@ -341,10 +341,10 @@ SYMBOLS = ["BTC-USDC-PERP", "ETH-USDC-PERP", "SOL-USDC-PERP"]
 DEFAULT_LEVERAGE = 3
 # Risk & Capital Architecture (15m Sniper Maximum Profit Engine on $1M pool)
 # Scaled notional ($120k-$180k) with strict breakeven protection and 30-minute patience cooldown
-RISK_FACTOR = 0.010
-MAX_SINGLE_TRADE_NOTIONAL = 250000.0  # Max $250k notional per single trade (~0.25x portfolio leverage)
-MAX_PORTFOLIO_NOTIONAL = 500000.0     # Max $500k total notional across all assets (~0.50x total leverage)
-TRADE_COOLDOWN_SECONDS = 1800         # 30-minute cooldown per symbol (strictly eliminates overtrading churn)
+RISK_FACTOR = 0.020
+MAX_SINGLE_TRADE_NOTIONAL = 500000.0  # Max $500k notional per single trade (Tournament Blitz)
+MAX_PORTFOLIO_NOTIONAL = 1000000.0   # Max $1.0M total notional across all assets (~1.1x total leverage)
+TRADE_COOLDOWN_SECONDS = 1200         # 20-minute cooldown per symbol
 
 LOOP_INTERVAL_SECONDS = 15
 FEED_INTERVAL_SECONDS = 2
@@ -413,35 +413,35 @@ TRAILING_RETRACE_RATIO = 0.35
 TAKE_PROFIT_ATR_MULT = 2.5           # Positive 1:2.0+ Risk/Reward target
 STOP_LOSS_ATR_MULT = 1.2             # Controlled risk distance
 
-# Directional & Harvest Calibration (Active 2-Tier Alpha Sniper Engine)
-TREND_TP_PCT = 0.048                 # +4.80% trend take-profit target
-TREND_SL_PCT = 0.0085                # -0.85% controlled protective stop loss
-BREAKEVEN_TRIGGER_PCT = 0.0085       # +0.85% trigger to lock stop loss at breakeven (risk-free runner)
-TREND_TRAILING_TRIGGER = 0.022       # +2.20% trigger for trailing profit runner
-TREND_TRAILING_RETRACE = 0.008       # 80 bps trailing pullback allowance
+# Directional & Harvest Calibration (Tournament Alpha Blitz Engine v7.0.0)
+TREND_TP_PCT = 0.055                 # +5.50% tournament trend take-profit target
+TREND_SL_PCT = 0.0140                # -1.40% protective stop loss with volatility breathing room
+BREAKEVEN_TRIGGER_PCT = 0.0120       # +1.20% trigger to lock stop loss at breakeven (risk-free runner)
+TREND_TRAILING_TRIGGER = 0.025       # +2.50% trigger for trailing profit runner
+TREND_TRAILING_RETRACE = 0.009       # 90 bps trailing pullback allowance
 TREND_ADX_THRESHOLD = 22.0           # Entry ADX threshold for active participation
 HIGH_ADX_THRESHOLD = 25.0            # High-conviction ADX threshold for Tier-1 Alpha sizing
-PROFIT_HARVEST_MIN_PNL_PCT = 0.045   # +4.50% minimum before profit harvest can trigger
-PROFIT_HARVEST_MIN_USD = 7500.0      # $7,500 dollar profit floor
+PROFIT_HARVEST_MIN_PNL_PCT = 0.050   # +5.00% minimum before profit harvest can trigger
+PROFIT_HARVEST_MIN_USD = 15000.0     # $15,000 dollar profit floor
 CANDLE_INTERVAL = "15m"              # 15-minute execution timeframe
 MACRO_CANDLE_INTERVAL = "1h"          # 1-hour macro anchor timeframe
 STOP_LOSS_QUARANTINE_SECONDS = 7200   # 2-hour quarantine on symbol post stop-loss
 MIN_CONFIDENCE_SCORE = 65.0           # Min confidence score for Tier-2 Tactical entries
-HIGH_CONFIDENCE_SCORE = 78.0          # High-confidence threshold for Tier-1 Alpha sizing ($220k-$250k)
+HIGH_CONFIDENCE_SCORE = 78.0          # High-confidence threshold for Tier-1 Alpha sizing ($350k-$500k)
 STANDARD_SYMBOL_NOTIONALS = {
-    "BTC-USDC-PERP": 150000.0,
-    "ETH-USDC-PERP": 130000.0,
-    "SOL-USDC-PERP": 110000.0,
+    "BTC-USDC-PERP": 300000.0,
+    "ETH-USDC-PERP": 250000.0,
+    "SOL-USDC-PERP": 200000.0,
 }
 HIGH_CONFIDENCE_SYMBOL_NOTIONALS = {
-    "BTC-USDC-PERP": 250000.0,
-    "ETH-USDC-PERP": 220000.0,
-    "SOL-USDC-PERP": 180000.0,
+    "BTC-USDC-PERP": 500000.0,
+    "ETH-USDC-PERP": 450000.0,
+    "SOL-USDC-PERP": 350000.0,
 }
 TARGET_SYMBOL_NOTIONALS_CONFIG = {
-    "BTC-USDC-PERP": 250000.0,
-    "ETH-USDC-PERP": 220000.0,
-    "SOL-USDC-PERP": 180000.0,
+    "BTC-USDC-PERP": 500000.0,
+    "ETH-USDC-PERP": 450000.0,
+    "SOL-USDC-PERP": 350000.0,
 }
 
 # Check if external calibrated params exist and load them
@@ -1859,10 +1859,10 @@ class QuantitativeTradingAgent:
 
             # Scaled notional based on confidence tier
             if conf_score >= HIGH_CONFIDENCE_SCORE:
-                target_notional = HIGH_CONFIDENCE_SYMBOL_NOTIONALS.get(symbol, 250000.0)
+                target_notional = HIGH_CONFIDENCE_SYMBOL_NOTIONALS.get(symbol, 500000.0)
                 logger.info(f"[{symbol}] TIER 1 ALPHA BUY SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
             else:
-                target_notional = STANDARD_SYMBOL_NOTIONALS.get(symbol, 150000.0)
+                target_notional = STANDARD_SYMBOL_NOTIONALS.get(symbol, 300000.0)
                 logger.info(f"[{symbol}] TIER 2 TACTICAL BUY SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
 
             # If holding a Module C carry position, close it to free up margin for the trend runner
@@ -1890,10 +1890,10 @@ class QuantitativeTradingAgent:
 
             # Scaled notional based on confidence tier
             if conf_score >= HIGH_CONFIDENCE_SCORE:
-                target_notional = HIGH_CONFIDENCE_SYMBOL_NOTIONALS.get(symbol, 250000.0)
+                target_notional = HIGH_CONFIDENCE_SYMBOL_NOTIONALS.get(symbol, 500000.0)
                 logger.info(f"[{symbol}] TIER 1 ALPHA SELL SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
             else:
-                target_notional = STANDARD_SYMBOL_NOTIONALS.get(symbol, 150000.0)
+                target_notional = STANDARD_SYMBOL_NOTIONALS.get(symbol, 300000.0)
                 logger.info(f"[{symbol}] TIER 2 TACTICAL SELL SIGNAL: Confidence={conf_score:.1f}/100 | Target Notional=${target_notional:,.0f}")
 
             # If holding a Module C carry position, close it to free up margin for the trend runner

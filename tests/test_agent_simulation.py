@@ -211,18 +211,18 @@ class TestQuantAgentSimulation(unittest.TestCase):
 
     def test_positive_risk_reward_configuration(self):
         """Verify that risk parameters maintain positive risk-reward ratio."""
-        self.assertLessEqual(qta.TREND_SL_PCT, 0.010)
+        self.assertLessEqual(qta.TREND_SL_PCT, 0.020)
         self.assertGreaterEqual(qta.TREND_TP_PCT, 0.040)
         self.assertGreater(qta.TREND_TP_PCT / qta.TREND_SL_PCT, 3.0)
-        self.assertLessEqual(qta.MAX_SINGLE_TRADE_NOTIONAL, 250000.0)
-        self.assertLessEqual(qta.MAX_PORTFOLIO_NOTIONAL, 500000.0)
+        self.assertLessEqual(qta.MAX_SINGLE_TRADE_NOTIONAL, 500000.0)
+        self.assertLessEqual(qta.MAX_PORTFOLIO_NOTIONAL, 1000000.0)
 
     def test_calibrated_symbol_notionals(self):
         """Verify that target symbol notionals are properly configured for alpha sizing."""
         notionals = self.agent.target_symbol_notionals
-        self.assertEqual(notionals.get("BTC-USDC-PERP"), 250000.0)
-        self.assertEqual(notionals.get("ETH-USDC-PERP"), 220000.0)
-        self.assertEqual(notionals.get("SOL-USDC-PERP"), 180000.0)
+        self.assertEqual(notionals.get("BTC-USDC-PERP"), 500000.0)
+        self.assertEqual(notionals.get("ETH-USDC-PERP"), 450000.0)
+        self.assertEqual(notionals.get("SOL-USDC-PERP"), 350000.0)
 
     def test_carry_position_upgrade_to_trend(self):
         """Verify that a small Module C carry position upgrades to Module A trend on valid signal."""

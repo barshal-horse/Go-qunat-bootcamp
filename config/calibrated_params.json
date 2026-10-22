@@ -1,37 +1,37 @@
 {
-  "version": "6.1.0-active-alpha-sniper",
-  "timestamp": "2026-10-18T12:30:00.000000Z",
-  "strategy": "Active 2-Tier High-Conviction Alpha Sniper Engine v6.1.0 (Oct 26 Final Stretch)",
-  "target_apr_pct": 140.0,
-  "daily_profit_target_usd": 8000.0,
+  "version": "7.0.0-tournament-alpha-blitz",
+  "timestamp": "2026-10-22T10:50:00.000000Z",
+  "strategy": "Tournament Alpha Blitz Engine v7.0.0 (Oct 26 Championship Sprint)",
+  "target_apr_pct": 280.0,
+  "daily_profit_target_usd": 25000.0,
   "risk_management": {
-    "risk_factor": 0.010,
-    "max_single_trade_notional": 250000.0,
-    "max_portfolio_notional": 500000.0,
-    "trade_cooldown_seconds": 1800,
+    "risk_factor": 0.020,
+    "max_single_trade_notional": 500000.0,
+    "max_portfolio_notional": 1000000.0,
+    "trade_cooldown_seconds": 1200,
     "stop_loss_quarantine_seconds": 7200,
-    "min_atr_ratio": 0.0055,
-    "max_fee_to_profit_ratio": 0.15
+    "min_atr_ratio": 0.0050,
+    "max_fee_to_profit_ratio": 0.12
   },
   "confidence_engine": {
     "min_confidence_score": 65.0,
     "high_confidence_score": 78.0,
     "require_macro_alignment": true,
     "standard_symbol_notionals": {
-      "BTC-USDC-PERP": 150000.0,
-      "ETH-USDC-PERP": 130000.0,
-      "SOL-USDC-PERP": 110000.0
+      "BTC-USDC-PERP": 300000.0,
+      "ETH-USDC-PERP": 250000.0,
+      "SOL-USDC-PERP": 200000.0
     },
     "high_confidence_symbol_notionals": {
-      "BTC-USDC-PERP": 250000.0,
-      "ETH-USDC-PERP": 220000.0,
-      "SOL-USDC-PERP": 180000.0
+      "BTC-USDC-PERP": 500000.0,
+      "ETH-USDC-PERP": 450000.0,
+      "SOL-USDC-PERP": 350000.0
     }
   },
   "target_symbol_notionals": {
-    "BTC-USDC-PERP": 250000.0,
-    "ETH-USDC-PERP": 220000.0,
-    "SOL-USDC-PERP": 180000.0
+    "BTC-USDC-PERP": 500000.0,
+    "ETH-USDC-PERP": 450000.0,
+    "SOL-USDC-PERP": 350000.0
   },
   "module_a_trend": {
     "candle_interval": "15m",
@@ -43,22 +43,22 @@
     "rsi_period": 14,
     "adx_threshold": 22.0,
     "high_adx_threshold": 25.0,
-    "target_tp_pct": 0.048,
-    "stop_loss_pct": 0.0085,
-    "breakeven_trigger_pct": 0.0085,
-    "trailing_trigger_pct": 0.022,
-    "trailing_retrace_pct": 0.008
+    "target_tp_pct": 0.055,
+    "stop_loss_pct": 0.0140,
+    "breakeven_trigger_pct": 0.0120,
+    "trailing_trigger_pct": 0.025,
+    "trailing_retrace_pct": 0.009
   },
   "module_c_funding": {
     "funding_entry_threshold": 0.00015,
     "funding_exit_threshold": 0.00010,
-    "target_carry_notional": 80000.0
+    "target_carry_notional": 100000.0
   },
   "position_management": {
-    "breakeven_trigger_pct": 0.0085,
-    "take_profit_atr_mult": 3.5,
-    "stop_loss_atr_mult": 1.2,
-    "profit_harvest_min_pnl_pct": 0.045,
-    "profit_harvest_min_usd": 7500.0
+    "breakeven_trigger_pct": 0.0120,
+    "take_profit_atr_mult": 4.0,
+    "stop_loss_atr_mult": 1.6,
+    "profit_harvest_min_pnl_pct": 0.050,
+    "profit_harvest_min_usd": 15000.0
   }
 }
