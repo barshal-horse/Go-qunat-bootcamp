@@ -1,38 +1,23 @@
 # Agent Session Memory & Strategy Status
 
-## Current Context (October 22, 2026 - 16:20 IST / 10:50 UTC)
-- **Time**: 16:20 IST Oct 22 (10:50 UTC Oct 22).
-- **Deadline**: October 26, 2026 (~4 days remaining).
-- **Total Account Collateral**: **$948,975.07 USDC**.
-- **Free Collateral**: **$862,300.45 USDC** (90.9% liquid cash).
-- **Target Recovery to Breakeven**: **+$51,024.93**.
-- **Strategy State**: Deployed **Engine v7.0.0 Tournament Alpha Blitz Mode**.
+## Current Context (October 22, 2026 - 20:20 IST / 14:50 UTC)
+- **Time**: 20:20 IST Oct 22 (14:50 UTC Oct 22).
+- **Deadline**: October 26, 2026 (~3.8 days remaining).
+- **Total Account Collateral**: **$949,160.87 USDC** (Up +$185.80 since previous check).
+- **Net Deficit from Starting $1M**: **-$50,839.13**.
+- **Free Collateral**: **$532,427.55 USDC** (56.1% liquid cash cushion).
+- **Position Margin in Use**: $116,717.74 USDC (~0.37x leverage).
+- **Active Runner**: GitHub Actions Run `39767171943` running continuously on commit `5dcaff0` (Engine v7.0.0 Tournament Blitz).
 
-## Architecture & Parameters: Engine v7.0.0 Tournament Blitz Mode
-1. **Asymmetric 2x High-Alpha Sizing**:
-   - **Tier 1 (High Conviction $\ge 78$, 1H Macro Alignment)**:
-     - **BTC-USDC-PERP**: **$500,000.00**
-     - **ETH-USDC-PERP**: **$450,000.00**
-     - **SOL-USDC-PERP**: **$350,000.00**
-     - Single +5.5% runner capture on Tier 1 yields **+$27,500**! Just 2 winning runners completely eliminates the -$51,025 deficit.
-   - **Tier 2 (Tactical Momentum Runner $65 \le C < 78$)**:
-     - **BTC-USDC-PERP**: **$300,000.00**
-     - **ETH-USDC-PERP**: **$250,000.00**
-     - **SOL-USDC-PERP**: **$200,000.00**
-     - Captures **+$16,500** per runner.
-2. **Breathing Room Stop Loss & Asymmetric R:R**:
-   - **Stop Loss**: **-1.40%** (`stop_loss_pct: 0.0140`). Gives trades ample breathing room against normal 15m ATR noise, avoiding false-wick premature stopouts.
-   - **Take Profit Target**: **+5.50%** (`target_tp_pct: 0.055`).
-   - **Reward-to-Risk Ratio**: **3.93 : 1** (Risking $7k to make $27.5k).
-   - **Breakeven Shield Lock**: **+1.20%** (`breakeven_trigger_pct: 0.0120`). Once position enters momentum expansion (+1.2%), entry price is shielded risk-free.
-3. **Risk Management Caps**:
-   - Single trade cap: **$500,000**
-   - Total portfolio ceiling: **$1,000,000** (~1.05x leverage — eliminates exchange liquidation risk while giving full firepower).
+## Active Tournament Blitz Positions & Orders
+1. **SOL-USDC-PERP**: SHORT 3,354.24 SOL @ $104.38 (Tier 1 Blitz Entry)
+   - **Notional**: **$350,057.01**
+   - **Current Mark**: $104.36
+   - **Unrealized PnL**: **+$58.57 (GREEN 🟢)**
+   - **Resting Take-Profit**: Limit BUY 3,354.24 SOL @ **$98.63** (Target Runner: **+$19,286.88**)
+2. **BTC-USDC-PERP**: Active resting Limit SELL orders for 3.6569 BTC (~**$300,000 notional**) @ **$82,060.00**.
 
-## Verification
-- **Test Suite**: 16/16 unit and simulation tests passed cleanly (`tests/test_agent_simulation.py`).
-- **Disk Verification**: Verified on disk against Python 3.10.
-
-## Next Steps
-- Commit and push to `origin/main` to trigger active runner reload on GitHub Actions.
-- Monitor execution of incoming 15m breakout candles across BTC, ETH, and SOL.
+## Strategy Performance Under v7.0.0
+- The 2x high-alpha sizing successfully activated: SOL position was scaled to $350k notional.
+- Widened SL breathing room (-1.40%) is actively protecting the position from premature noise stop-outs.
+- Single-trade runner target on SOL is positioned to capture **+$19,287**, which alone will recover ~38% of the remaining deficit in one move.
