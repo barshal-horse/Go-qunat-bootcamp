@@ -1,11 +1,7 @@
-name: GoDark Quant Agent (Bootcamp)
+name: GoDark Quant Agent (Bootcamp - Concluded)
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'  # Safety watchdog: triggers every 6h as secondary fallback (prevents mid-flight collisions)
-  push:
-    branches:
-      - main
+  # Automated triggers disabled post-bootcamp conclusion (manual dispatch only)
   workflow_dispatch:
 
 permissions:
@@ -60,15 +56,10 @@ jobs:
           path: trades.log
           retention-days: 90
 
-      - name: Auto-chain Next Continuous Session
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Current session finished. Triggering next continuous session immediately..."
-          gh workflow run "GoDark Quant Agent (Bootcamp)" --ref main || \
-          curl -s -X POST \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/quant-agent.yml/dispatches \
-            -d '{"ref":"main"}' || true
+      # Auto-chaining permanently disabled post-bootcamp conclusion
+      # - name: Auto-chain Next Continuous Session
+      #   if: success()
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   run: |
+      #     echo "Auto-chain disabled."
